@@ -145,4 +145,5 @@ access. It's a little bigger. Most people should use the normal download.
 
 ---
 
-Building the app or curious how it works? See the [development notes](docs/DEVELOPMENT.md).
+Building the app or curious how it works? See the [development notes](docs/DEVELOPMENT.md). Released under the
+[MIT License](LICENSE).

@@ -342,5 +342,8 @@ ADB: [libadb-android](https://github.com/MuntashirAkon/libadb-android) 3.1.1. An
 [HiddenApiBypass](https://github.com/LSPosed/AndroidHiddenApiBypass) 4.3. Shizuku client:
 [Shizuku-API](https://github.com/RikkaApps/Shizuku-API) 13.1.5. QR codes: [ZXing](https://github.com/zxing/zxing) core 3.5.4,
 and in the google build the
-[Google code scanner](https://developers.google.com/ml-kit/vision/barcode-scanning/code-scanner) 16.1.0. Consult each
-dependency's bundled licenses before distributing the APK.
+[Google code scanner](https://developers.google.com/ml-kit/vision/barcode-scanning/code-scanner) 16.1.0.
+
+The app's own code is under the [MIT License](../LICENSE). The libraries keep their own: libadb-android is
+GPL-3.0-or-later or Apache-2.0, with an LGPL dependency, HiddenApiBypass and ZXing are Apache-2.0, and Shizuku-API is MIT.
+Their licence texts have to reach people with the APK, which the app doesn't do yet.
