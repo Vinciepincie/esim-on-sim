@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Shizuku's library declares Android 7, for three calls this app never makes (see apdu/ShizukuClient). -->
+    <uses-sdk tools:overrideLibrary="rikka.shizuku.api" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Pairing: the code is typed into a notification, so Settings can stay open. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Keeps an install or a switch running with the screen off, and only then (ui/CardWork). -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Android 17+: finds Wireless debugging's pairing and connection ports over mDNS. Asked for only then. -->
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
+    <!-- Not enforced yet: staged in Android 17 for traffic over 127.0.0.1, which card access uses throughout. -->
+    <uses-permission android:name="android.permission.USE_LOOPBACK_INTERFACE" />
+    <!-- The app's own QR scanner. Asked for when it opens; phones without a camera can still install the app. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+    <!-- libadb's manifest declares minSdkVersion 1, so the merger adds these legacy permissions. The app
+         never uses them: the card helper runs as the shell user or root, with their own. -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" tools:node="remove" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" tools:node="remove" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" tools:node="remove" />
+
+    <!-- Reads Wireless debugging's page title from Settings, to open that page with it; and tells whether Shizuku
+         is installed, to offer starting it. -->
+    <queries>
+        <package android:name="com.android.settings" />
+        <package android:name="moe.shizuku.privileged.api" />
+    </queries>
+
+    <application
+        android:name=".EsimApp"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="false"
+        android:enableOnBackInvokedCallback="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="eSIM On-SIM"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.EsimOnSim"
+        tools:targetApi="33">
+
+        <!-- One instance, so a code shared from another app reaches the same card connection (onNewIntent)
+             instead of starting a second one. -->
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- An activation code, or a screenshot of its QR code, shared from an email or a seller's app. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+            <!-- LPA:1$… links. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <!-- Scheme matching is case-sensitive, and activation codes are written "LPA:". -->
+                <data android:scheme="lpa" />
+                <data android:scheme="LPA" tools:ignore="AppLinkUrlError" />
+            </intent-filter>
+            <!-- "Install on iPhone" links. Unverified, so Android 12+ opens them here only once people allow it
+                 (Details › eSIM links). -->
+            <intent-filter android:autoVerify="false">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="esimsetup.apple.com"
+                    android:pathPrefix="/esim_qrcode_provisioning" />
+            </intent-filter>
+        </activity>
+
+        <!-- What the app is for and how it reaches the card (AboutScreen.kt). -->
+        <activity
+            android:name=".ui.AboutActivity"
+            android:exported="false" />
+
+        <!-- The app's own QR scanner (ScanActivity.kt). -->
+        <activity
+            android:name=".ui.ScanActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation"
+            android:exported="false"
+            android:theme="@style/Theme.EsimOnSim.Scan" />
+
+        <!-- Keeps pairing alive for up to ~3 minutes while Settings is on screen. -->
+        <service
+            android:name=".adb.PairingService"
+            android:exported="false"
+            android:foregroundServiceType="shortService" />
+
+        <!-- Keeps the app alive for up to ~3 minutes while an eSIM installs or switches (ui/CardWork). -->
+        <service
+            android:name=".ui.CardWorkService"
+            android:exported="false"
+            android:foregroundServiceType="shortService" />
+
+        <!-- Shizuku's server hands this app its connection here. The permission is all that stops other apps from
+             handing it a fake one, so it must stay. Shizuku's library crashes the app at every start without
+             multiprocess="false" and exported="true". -->
+        <provider
+            android:name=".apdu.ShizukuBinderProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:multiprocess="false"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <!-- Compose's emoji library would have Play services load its font at every start, about 3.5 MB of memory for
+             the odd emoji in an eSIM's nickname. Those use the phone's own font instead. Lint can't see this class,
+             which only comes with libraries at run time. -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:ignore="MissingClass"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.emoji2.text.EmojiCompatInitializer"
+                tools:node="remove" />
+        </provider>
+
+    </application>
+</manifest>

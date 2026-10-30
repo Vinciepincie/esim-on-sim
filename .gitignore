@@ -1,0 +1,36 @@
+.gradle/
+.kotlin/
+**/build/
+local.properties
+*.iml
+.idea/
+_research/**/*.apk
+_research/**/*.dex
+_research/**/*.class
+_research/**/*.log
+_research/**/*.xml
+_research/**/*.png
+_research/**/*.json
+_research/apks/
+_research/shizuku/
+
+# Signing material: never commit release keys or their passwords
+*.jks
+*.keystore
+keystore.properties
+
+# Built packages and other generated output outside build/
+*.apk
+*.aab
+*.ap_
+captures/
+.externalNativeBuild/
+.cxx/
+*.hprof
+*.log
+
+# Editors / OS / local agent settings
+.vscode/
+.DS_Store
+Thumbs.db
+.claude/settings.local.json

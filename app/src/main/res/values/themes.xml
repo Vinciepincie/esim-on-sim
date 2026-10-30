@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Host theme only; Compose draws the UI. values-night swaps in a dark parent so
+         the window doesn't flash white before the first frame in dark mode. The window
+         background matches the Compose surface colour (Theme.kt) for the same reason. -->
+    <style name="Theme.EsimOnSim" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/window_background</item>
+        <!-- Android 6-11 show this window at launch: without these, a grey status bar until the first frame. -->
+        <item name="android:statusBarColor">@color/window_background</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+
+    <!-- The QR scanner (ScanActivity): dark in either mode, the camera picture on black. A parent of its own,
+         so values-night needs no copy. -->
+    <style name="Theme.EsimOnSim.Scan" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@android:color/black</item>
+    </style>
+
+    <color name="window_background">#F9F9F9</color>
+    <color name="ic_launcher_background">#1F1F1F</color>
+</resources>

@@ -1,0 +1,4 @@
+# The app's own code, compiled ahead of time once the profile is installed (profileinstaller writes it on
+# first launch; Android compiles it when the phone is idle). Libraries ship their own, e.g. Compose's.
+HSPLcom/esimonsim/**->**(**)**
+Lcom/esimonsim/**;

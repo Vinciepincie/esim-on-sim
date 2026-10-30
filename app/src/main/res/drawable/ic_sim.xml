@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SIM card with its chip cut out (the chip runs the other way round); the notification icon and in-app card glyph. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+    <path android:fillColor="#FF000000"
+        android:pathData="M7,2h7l5,5v13a2,2 0,0 1,-2 2H7a2,2 0,0 1,-2 -2V4a2,2 0,0 1,2 -2z M8.5,11a1,1 0,0 0,-1 1v5a1,1 0,0 0,1 1h7a1,1 0,0 0,1 -1v-5a1,1 0,0 0,-1 -1z" />
+</vector>

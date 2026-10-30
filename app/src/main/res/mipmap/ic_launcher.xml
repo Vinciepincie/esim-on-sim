@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 6 and 7, before adaptive icons (mipmap-anydpi-v26): the same SIM, on a round background cut to the
+     part an adaptive icon shows. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="72"
+    android:viewportHeight="72">
+    <path
+        android:fillColor="@color/ic_launcher_background"
+        android:pathData="M36,2a34,34 0,1 1,0 68a34,34 0,1 1,0 -68z" />
+    <group android:translateX="-18" android:translateY="-18">
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M40,29h20l12,12v36a4,4 0,0 1,-4 4h-28a4,4 0,0 1,-4 -4v-44a4,4 0,0 1,4 -4z M45,50a2,2 0,0 0,-2 2v14a2,2 0,0 0,2 2h18a2,2 0,0 0,2 -2v-14a2,2 0,0 0,-2 -2z" />
+    </group>
+</vector>

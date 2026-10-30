@@ -1,0 +1,124 @@
+# Builds, signs and publishes a GitHub Release for each pushed tag like v0.3. Bump versionName and versionCode in
+# app/build.gradle.kts in a commit first, then tag that commit.
+#
+# Secrets: RELEASE_KEYSTORE_BASE64, RELEASE_KEYSTORE_PASSWORD, RELEASE_KEY_ALIAS, RELEASE_KEY_PASSWORD.
+# Repository variable: RELEASE_CERT_SHA256, the key's certificate digest from keytool -list -v.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      STANDALONE_APK: app/build/outputs/apk/standalone/release/app-standalone-release.apk
+      GOOGLE_APK: app/build/outputs/apk/google/release/app-google-release.apk
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the Gradle wrapper is genuine
+        uses: gradle/actions/wrapper-validation@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+
+      - name: Check the tag matches the app's version
+        run: |
+          version=$(sed -n 's/^ *versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match versionName $version in app/build.gradle.kts."
+            exit 1
+          fi
+
+      # A fresh runner's debug key would give people APKs that can't update over each other, so stop here without the
+      # real one.
+      - name: Decode the release key
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+          RELEASE_CERT_SHA256: ${{ vars.RELEASE_CERT_SHA256 }}
+        run: |
+          missing=0
+          for name in RELEASE_KEYSTORE_BASE64 RELEASE_KEYSTORE_PASSWORD RELEASE_KEY_ALIAS RELEASE_KEY_PASSWORD \
+                      RELEASE_CERT_SHA256; do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name isn't set in the repository's Actions secrets and variables."
+              missing=1
+            fi
+          done
+          [ "$missing" = 0 ]
+          umask 077
+          printf %s "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release.keystore"
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # No cache: a tag can't reuse another tag's, and a release is better built from nothing.
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          cache-disabled: true
+
+      - name: Test
+        run: ./gradlew --no-daemon :app:testStandaloneDebugUnitTest :app:testGoogleDebugUnitTest :app:lintStandaloneDebug
+
+      # The only step that sees the passwords. No configuration cache, so they aren't written to disk.
+      - name: Build both release APKs
+        env:
+          ESIM_KEYSTORE: ${{ runner.temp }}/release.keystore
+          ESIM_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          ESIM_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          ESIM_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon --no-configuration-cache :app:assembleStandaloneRelease :app:assembleGoogleRelease
+
+      - name: Check both APKs carry the release certificate
+        env:
+          RELEASE_CERT_SHA256: ${{ vars.RELEASE_CERT_SHA256 }}
+        run: |
+          # keytool prints the digest in upper case with colons, apksigner in lower case without.
+          expected=$(printf %s "$RELEASE_CERT_SHA256" | tr -d ': ' | tr '[:upper:]' '[:lower:]')
+          for apk in "$STANDALONE_APK" "$GOOGLE_APK"; do
+            actual=$("$ANDROID_HOME/build-tools/37.0.0/apksigner" verify --print-certs "$apk" \
+              | sed -n 's/^.*Signer.*certificate SHA-256 digest: //p' | sort -u)
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::$apk is signed with ${actual:-no certificate}, not the release certificate $expected."
+              exit 1
+            fi
+          done
+
+      - name: Collect the release files
+        run: |
+          mkdir dist
+          cp "$STANDALONE_APK" dist/eSIM-On-SIM.apk
+          cp "$GOOGLE_APK" dist/eSIM-On-SIM-google.apk
+          (cd dist && sha256sum eSIM-On-SIM.apk eSIM-On-SIM-google.apk > SHA256SUMS.txt)
+          (cd app/build/outputs/mapping \
+            && zip "$GITHUB_WORKSPACE/dist/debug-symbols.zip" standaloneRelease/mapping.txt googleRelease/mapping.txt)
+
+      # What to download and how to get past the unknown-apps prompt. No generated list of changes: it's for developers,
+      # and this page is for people who want the app.
+      - name: Write the release description
+        run: |
+          sed -e "s|{{repo}}|$GITHUB_REPOSITORY|g" -e "s|{{tag}}|$GITHUB_REF_NAME|g" \
+            .github/release-notes.md > "$RUNNER_TEMP/release-notes.md"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --title "eSIM On-SIM $GITHUB_REF_NAME" \
+            --notes "$(cat "$RUNNER_TEMP/release-notes.md")"
+
+      - name: Delete the decoded key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.keystore"
