@@ -106,8 +106,9 @@ Yes. Your eSIMs are stored on the card, not in the app.
 <details>
 <summary><b>Can I get an eSIM back after deleting it?</b></summary>
 
-Usually not. Most eSIMs can be downloaded only once, so you'd lose any data or credit left on it. If you just want it out
-of the list, choose Hide instead.
+It depends on the provider. Most QR codes work only once, so the same code usually won't work again, but many providers can
+give you a new eSIM. Some charge for that, and data or credit left on the old one may not carry over, so ask them before you
+delete it. If you just want it out of the list, choose Hide instead.
 </details>
 
 <details>
