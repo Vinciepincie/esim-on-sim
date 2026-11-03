@@ -6,32 +6,48 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.esimonsim.R
 import com.esimonsim.apdu.AccessMethod
 
-/** What the app is for, the ways it reaches a card (and what root, Shizuku and Wireless debugging are), and what it
- *  sends over the internet. An activity of its own, so setup and the card screen can both open it; a code shared to the
+/** What the app is for, the ways it reaches a card (and what root, Shizuku and Wireless debugging are), what it sends
+ *  over the internet, and on a page of its own the licenses of what it's made with. An activity of its own, so setup and the card screen can both open it; a code shared to the
  *  app meanwhile closes it, since MainActivity is singleTask. */
 class AboutActivity : ComponentActivity() {
+    // Android 11 and older: the Theme setting, before anything reads a resource (see ThemeSetting).
+    override fun attachBaseContext(newBase: Context) {
+        super.attachBaseContext(newBase)
+        ThemeSetting.override(newBase)?.let(::applyOverrideConfiguration)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
@@ -57,23 +73,39 @@ class AboutActivity : ComponentActivity() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun AboutScreen(method: AccessMethod?, helperWorks: Boolean, onBack: () -> Unit) {
-    val scroll = TopAppBarDefaults.pinnedScrollBehavior()
+    var licenses by rememberSaveable { mutableStateOf(false) }
+    // The license that's open, by its row's name, so a rotation keeps it open.
+    var reading by rememberSaveable { mutableStateOf<String?>(null) }
+    val library = reading?.let { name -> (LIBRARIES + THIS_APP).firstOrNull { it.name == name } }
+    // Out here, so coming back to a page finds it where it was.
+    val aboutScroll = rememberScrollState()
+    val licensesScroll = rememberScrollState()
+    val up: () -> Unit = { if (library != null) reading = null else licenses = false }
+    BackHandler(enabled = licenses, onBack = up)
+    // One state per page: a page that's scrolled doesn't colour the bar of the next.
+    val scroll = TopAppBarDefaults.pinnedScrollBehavior(key(licenses, reading) { rememberTopAppBarState() })
     Scaffold(
         modifier = Modifier.nestedScroll(scroll.nestedScrollConnection),
         topBar = {
             TopAppBar(
-                title = { Text("About") },
+                title = {
+                    Text(library?.name ?: if (licenses) "Libraries & licenses" else "About", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                },
                 navigationIcon = {
-                    IconButton(onClick = onBack) { Icon(painterResource(R.drawable.ic_arrow_back), contentDescription = "Back") }
+                    IconButton(onClick = if (licenses) up else onBack) {
+                        Icon(painterResource(R.drawable.ic_arrow_back), contentDescription = "Back")
+                    }
                 },
                 scrollBehavior = scroll,
             )
         },
     ) { pad ->
-        Column(Modifier.fillMaxSize().padding(pad).consumeWindowInsets(pad).verticalScroll(rememberScrollState())
-                .padding(16.dp),
+        val inset = Modifier.fillMaxSize().padding(pad).consumeWindowInsets(pad)
+        if (library != null) return@Scaffold LicenseText(library, inset)
+        if (licenses) return@Scaffold LicensesPage(inset, licensesScroll) { reading = it.name }
+        Column(inset.verticalScroll(aboutScroll).padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            AppHeader()
+            AppHeader(onLicenses = { licenses = true })
             AboutCard("What it's for") {
                 Body("$APP_NAME manages the eSIMs on a removable eUICC: a physical SIM card that holds several eSIMs " +
                     "at once. It's also commonly known as an eSIM adapter, a physical eSIM card or by its brand name, " +
@@ -89,23 +121,27 @@ private fun AboutScreen(method: AccessMethod?, helperWorks: Boolean, onBack: () 
                     modifier = Modifier.semantics { heading() })
                 Body("Your card decides which apps may manage it, and most cards only let their maker's app in. No " +
                     "Android permission can change that. So each time it starts, this app tries the ways below in " +
-                    "order and uses the first that works.")
+                    "order and uses the first that works. To pick one yourself, open this app's Settings and tap " +
+                    "\"Card access\".")
             }
             AboutCard("Root", inUse = method == AccessMethod.ROOT) {
                 Body("Rooting gives you full control of a phone. It's something people do themselves; most phones " +
                     "aren't rooted, and this app doesn't need it.")
                 Body("On a rooted phone, this app asks your root app for access when it starts. Nothing to set up, " +
                     "and it works without Wi-Fi. Its small helper ends when you swipe this app away from Recent apps " +
-                    "or tap \"Stop card access\" in the app's menu. If your root app never asks, allow $APP_NAME in it.")
+                    "or tap \"Stop card access\" in this app's Settings. If your root app never asks, allow $APP_NAME " +
+                    "in it.")
             }
             AboutCard("Direct", inUse = method == AccessMethod.DIRECT) {
                 // Android's secure element API (OMAPI) came with Android 9.
                 if (Build.VERSION.SDK_INT >= 28) {
                     Body("Some cards let any app manage them. Then this app reaches the card through Android itself, " +
                         "with nothing to set up.")
+                    Body("It only reaches cards that let this app in. With another eSIM card in your phone that " +
+                        "doesn't, choose another way under \"Card access\" in this app's Settings to manage both.")
                     Body("Android keeps mobile data and roaming from apps, though, so after a switch the app offers " +
-                        "your phone's SIM settings for those. To have the app set them, see Details › Mobile data " +
-                        "and roaming.")
+                        "your phone's SIM settings for those. To have the app set them, see \"Mobile data and " +
+                        "roaming\" in this app's Settings.")
                 } else Body("Some cards let any app manage them, through Android itself. That needs Android 9 or " +
                     "newer, so not on this phone.")
             }
@@ -116,7 +152,7 @@ private fun AboutScreen(method: AccessMethod?, helperWorks: Boolean, onBack: () 
                 Body("If Shizuku is running, this app asks it for access. After that there's nothing to set up here. " +
                     "This app starts a small helper through it, which only talks to the card's eSIM manager and " +
                     "applies the mobile data and roaming choices you ticked. It ends when you swipe this app away " +
-                    "from Recent apps or tap \"Stop card access\" in the app's menu. Shizuku itself keeps running.")
+                    "from Recent apps or tap \"Stop card access\" in this app's Settings. Shizuku itself keeps running.")
                 Body("Shizuku has to be started again after your phone restarts. If you start it with Wireless " +
                     "debugging, Android can stop it when Wi-Fi drops, so don't count on it without Wi-Fi. Turning on " +
                     "\"USB debugging\" in Developer options may help, but some banking apps won't open while it's on.")
@@ -133,24 +169,36 @@ private fun AboutScreen(method: AccessMethod?, helperWorks: Boolean, onBack: () 
     }
 }
 
-/** The app's icon, name and version. */
+/** The app's icon, name and version, and the way to the licenses: beside them where there's room, else below. */
 @Composable
-private fun AppHeader() {
+private fun AppHeader(onLicenses: () -> Unit) {
     val context = LocalContext.current
     val version = remember { versionName(context) }
-    Row(Modifier.padding(horizontal = 8.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-        // The launcher icon's own art: its 72dp visible circle is drawn at 56dp.
-        Box(Modifier.size(56.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary),
-            contentAlignment = Alignment.Center) {
-            Icon(painterResource(R.drawable.ic_launcher_foreground), contentDescription = null,
-                Modifier.requiredSize(84.dp), tint = MaterialTheme.colorScheme.onPrimary)
-        }
-        Spacer(Modifier.width(16.dp))
-        Column {
-            Text(APP_NAME, style = MaterialTheme.typography.headlineSmall, modifier = Modifier.semantics { heading() })
-            version?.let {
-                Text("Version $it", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    FlowRow(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.SpaceBetween, itemVerticalAlignment = Alignment.CenterVertically) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            // The launcher icon's own art: its 72dp visible circle is drawn at 56dp.
+            Box(Modifier.size(56.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary),
+                contentAlignment = Alignment.Center) {
+                Icon(painterResource(R.drawable.ic_launcher_foreground), contentDescription = null,
+                    Modifier.requiredSize(84.dp), tint = MaterialTheme.colorScheme.onPrimary)
             }
+            Spacer(Modifier.width(16.dp))
+            Column {
+                Text(APP_NAME, style = MaterialTheme.typography.headlineSmall, modifier = Modifier.semantics { heading() })
+                version?.let {
+                    Text("Version $it", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
+        Row(Modifier.heightIn(min = 48.dp).clip(MaterialTheme.shapes.small).clickable(role = Role.Button, onClick = onLicenses)
+                .padding(start = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text("Libraries & licenses", style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.primary)
+            Spacer(Modifier.width(2.dp))
+            // The back arrow, turned around.
+            Icon(painterResource(R.drawable.ic_arrow_back), contentDescription = null, Modifier.size(16.dp).scale(-1f, 1f),
+                tint = MaterialTheme.colorScheme.primary)
         }
     }
 }
@@ -187,7 +235,7 @@ private fun WirelessDebuggingCard(inUse: Boolean, helperWorks: Boolean) =
                 "Some banking apps also won't open while Developer options is on. Turning that off stops card access " +
                 "until you turn it back on. It can also turn \"Disable adb authorization timeout\" back off, if you " +
                 "turned that on, so Android may forget the pairing again.\n\n" +
-                "To remove this app's access completely, tap \"Stop card access\" in the app's menu, then:\n" +
+                "To remove this app's access completely, tap \"Stop card access\" in this app's Settings, then:\n" +
                 path("Wireless debugging", "Paired devices", APP_NAME, "Forget"))
     }
 
@@ -211,7 +259,7 @@ private fun UsbDebuggingCard(inUse: Boolean) =
                     "Once card access is running, it usually keeps working after you turn that off, until your phone " +
                         "restarts."
                     else "Card access stops when you turn it off, and works again when you turn it back on.") +
-                "\n\nTo remove this app's access completely, tap \"Stop card access\" in the app's menu, then (this " +
+                "\n\nTo remove this app's access completely, tap \"Stop card access\" in this app's Settings, then (this " +
                 "also removes any computers you allowed):\n" + path("Developer options", "Revoke USB debugging authorizations"))
     }
 

@@ -24,6 +24,51 @@ allows, tried in this order at each start:
 
 Requires Android 6.0 (API 23) or newer. Direct access needs Android 9 (OMAPI).
 
+### Choosing the way in
+
+The app's own **Settings** (⋮ menu) has **Card access**: **Automatic**, which is the order above, or one way chosen
+(`access-method/preferred`). A chosen way is tried first at every start, with a fallback behind it so a working card is
+never lost:
+
+| Chosen | Order |
+| --- | --- |
+| Automatic | Root, Direct, Shizuku, ADB |
+| Direct | Direct, Shizuku, ADB |
+| Root | Root, Shizuku, ADB, Direct |
+| Shizuku | Shizuku, ADB, Direct |
+| ADB | ADB, Shizuku, Direct |
+
+- A way behind the chosen one never asks anything: Shizuku only connects when it already allows this app, and root,
+  whose app may ask, is never a fallback. On Android 10 and older, ADB behind a chosen way is only tried once the
+  phone allowed this app, without its "Allow USB debugging?" question, except from ADB's own setup and Reconnect
+  screens (`connect(forAdb = true)`). Direct comes last behind any other, as it only reaches cards that let this app
+  in, where the others reach every card. Choosing Direct is how a rooted phone stops the root question at each start.
+- ADB that's off or not set up costs nothing at start. A chosen Shizuku waits up to a second for Shizuku to hand over
+  its connection; so does a Shizuku behind a chosen Root or ADB, once, where Direct comes next: otherwise Direct would
+  win before Shizuku's connection arrived, and hide a second card for the whole run.
+- Why the chosen way didn't connect (`CardAccess.preferredFailure`) shows under Card access, and on the setup screens
+  when they're about another way. The choice stands until someone changes it: the app never clears it by itself.
+- Connected, a pick is saved only once it has connected. Not connected, it's saved at once, as there's nothing to lose.
+- The setup buttons ("Use root", "Use Shizuku instead", "Set up Wireless debugging instead") leave Automatic as it is,
+  but replace a chosen way, as "instead" says.
+
+**Switching while connected** (`CardAccess.switchTo`) connects the new way first and only then ends the old one, so a
+failed switch changes nothing ("Card access stays as it was"). So does Cancel during a switch to Shizuku or Wireless
+debugging: a way that connected all the same is let go (`ConnectCancelledException`), and nothing is saved. A
+background helper stays for SIM settings when Direct takes over. Automatic tries only the ways ranked above the one in use, asking nothing new. Choosing Wireless debugging
+before it's paired opens its setup over Settings (`SetupFor.SWITCH`), and on Android 10 and older the computer steps;
+card access carries on underneath until it's done. Afterwards the app forgets every card address, as each way
+numbers slots its own way, finds the cards again, and puts the one that was in view (or the one tapped) back in view by
+EID.
+
+**A second card that direct access can't open.** Android checks a card's access rules before it opens anything, and an
+ordinary SIM with none is refused the same way as an adapter card that only lets its maker's app in. So after a refusal
+the app reads that reader's ATR again in a fresh session (a session caches the ATR of the card it was opened on) and
+looks for the eUICC bit, as Android's own `AnswerToReset` does: the first TB after a T=15 TD with `0x82` set (ETSI TS
+102 221 §6.3.3, SGP.22 §3.4.1). Then the switcher shows **Card in SIM n**, "Doesn't let this app in directly", which
+leads to Card access. Phones that declare `FEATURE_TELEPHONY_EUICC` never get this row, as it could be their own chip;
+there Settings only asks whether a second card is missing. ATRs are never logged.
+
 ## Setting up ADB
 
 Only ADB needs setting up in this app. Where Shizuku is installed, the checklist
@@ -90,7 +135,7 @@ when someone tapped Connect.
 With direct access Android doesn't let the app change mobile data or data roaming,
 so the switch dialog leaves those choices out and a switch offers the SIM's own
 settings page instead. Where Shizuku allows this app, a switch sets them through
-it, and the card itself stays on direct access. Otherwise Details › **Mobile data
+it, and the card itself stays on direct access. Otherwise Settings › **Mobile data
 and roaming** optionally sets up ADB just for them (pairing Wireless debugging, or
 on Android 9 and 10 the computer route).
 
@@ -102,7 +147,8 @@ root) running for the apps people allow in it, so it's set up once, there. The a
 detects it by package name, and connects by itself once it's running:
 
 - Its server hands the app its connection a moment after the app starts, so the
-  first connection waits up to a second for it, only where Shizuku is installed.
+  first connection waits up to a second for it, only where Shizuku is installed. Not where ADB worked last time and can
+  go next: with Shizuku stopped, that would cost every start this second.
 - Shizuku shows its own question the first time, only with someone in the app, and
   the app waits a minute for the answer, which still counts if it comes later. A
   "Deny" there isn't remembered
@@ -151,7 +197,7 @@ Afterwards the app offers to name the new eSIM and switch to it.
 Codes also come in from other apps: **share** an email, a message or a QR
 screenshot to the app, or open an `LPA:1$…` link. "Install on iPhone" links
 (`esimsetup.apple.com`) open in the app once they are allowed under
-**Details › eSIM links** (Android 12+ asks for that). The code fills in the
+**Settings › eSIM links** (Android 12+ asks for that). The code fills in the
 Add eSIM form; nothing installs without a tap on **Install**.
 
 **Check for eSIMs sent to this card (SM-DS)** runs only when tapped. It asks up to three discovery servers (SM-DS): the one
@@ -169,14 +215,15 @@ them again:
   with the card restart, so it retries at about 5, 20 and 60 s, and anything left waits for the next card read. Only
   the newest unsent switch notice per eSIM is kept, so a provider whose server has gone can't fill the card.
 - After a failed load, CancelSession uses reason timeout(2), not loadBppExecutionError(5) as 3.1.3.3 says: reason 5
-  ends the order for good, and the activation code often still works.
+  ends the order for good, and the activation code often still works. It's also sent, card and server, when the
+  provider got a request but gave no clear answer (a server error, a garbled reply, a dropped connection), so the
+  session can't hold up the next try; not after the provider's own refusal, or when the server couldn't be reached.
 - Not checked: the server address and SM-DP+ OID in serverSigned1 against the activation code. Refusing a server that
   signs a canonical name rather than the code's alias would turn away real eSIMs that other LPAs install.
 - Not checked before install: Profile Policy Rules.
 - TLS accepts the system CA store as well as the bundled GSMA production roots (CI1, OISTE GSMA CI G1, Entrust), which
   is broader than 4.5.2.2. Test roots stay out: SGP.26 forbids them in commercial products and their keys are public.
 - Telephony APDUs don't carry the logical channel in CLA; the modems tested add it themselves.
-- With two removable cards the app only reaches the first it finds.
 
 ## What has been tested
 
@@ -189,6 +236,13 @@ them again:
 - Shizuku: stock Shizuku 13.6.0 with the simulated card on Android 14 and 17 emulators (asking, allowing, refusing,
   switching, its server dying and coming back, the helper ending with the app), not yet on a phone with a real card. On
   Android 6 only that the app still starts, since current Shizuku needs Android 7.
+- Several cards: only with simulated cards on emulators, so what real phones report for a slot they aren't using, and
+  whether one card's restart disturbs the other, is unverified.
+- Settings (choosing card access, switching while connected, the "Card in SIM n" row, Theme): JVM tests, and an Android
+  14 emulator with simulated cards and direct access; the Theme on Android 6 as well. On a real phone, whether its SIM
+  service gives OMAPI the card's full ATR is unverified, and so is the Theme on Android 16 and 17 with the accessibility
+  colour inversion on.
+- The Licenses page: JVM tests and an Android 14 emulator, both builds.
 - Not tested: other makes of card, real downloads after the audit's protocol changes, and vendor telephony
   implementations beyond the one phone.
 
@@ -204,7 +258,7 @@ gradlew.bat :app:assembleStandaloneDebug :app:testStandaloneDebugUnitTest :app:t
 There are two builds (product flavors) with the same app ID and signature, so either installs over the other and keeps
 the pairing:
 
-- **standalone** (the default): no Google code at all; QR codes are scanned with the app's own camera screen. Works on
+- **standalone** (the default): no Play services or ML Kit code; QR codes are scanned with the app's own camera screen. Works on
   phones without Google Play services.
 - **google**: scans with Google Play services' code scanner first (ML Kit), and with the app's own scanner when that
   can't be used.
@@ -227,7 +281,8 @@ Pushing a tag like `v0.3` runs [.github/workflows/release.yml](../.github/workfl
 signs both flavors, checks each APK's signing certificate, and publishes a GitHub Release with `eSIM-On-SIM.apk`,
 `eSIM-On-SIM-google.apk`, `SHA256SUMS.txt` and `debug-symbols.zip`. The file names don't change, so the README's download
 link always gets the newest version. Each release's description starts with
-[.github/release-notes.md](../.github/release-notes.md): what to download and how to allow the install.
+[.github/release-notes.md](../.github/release-notes.md): a short "What's new" for people who use the app, then what to
+download and how to allow the install.
 
 Once, before the first release, make the key. Back it up: without it, later versions can't be installed over earlier
 ones.
@@ -243,8 +298,9 @@ Then add it to the GitHub repository:
 - Variable: `RELEASE_CERT_SHA256`, the certificate's SHA-256 from `keytool -list -v`. The workflow refuses to publish an
   APK signed with anything else, since a runner's own debug key would give people APKs that can't update over each other.
 
-For each release, raise `versionCode` and `versionName` in `app/build.gradle.kts`, commit, then tag that commit with the
-same version and push both. The workflow stops if the tag and `versionName` differ.
+For each release, raise `versionCode` and `versionName` in `app/build.gradle.kts`, rewrite "What's new" in
+`.github/release-notes.md` in plain words (no internals), commit, then tag that commit with the same version and push
+both. The workflow stops if the tag and `versionName` differ.
 
 Local release builds sign with the same key when the `ESIM_KEYSTORE`, `ESIM_KEYSTORE_PASSWORD`, `ESIM_KEY_ALIAS` and
 `ESIM_KEY_PASSWORD` variables are set, or a git-ignored `keystore.properties` has `storeFile`, `storePassword`, `keyAlias`
@@ -269,7 +325,25 @@ adb shell 'echo "{\"delayMs\":250,\"refreshMs\":6000,\"dropEnableReply\":true}" 
 
 Options: `delayMs`, `jitterMs`, `failRate`, `hangAt`, `exitAt`, `refreshMs`,
 `dropEnableReply`, `useSimDelayMs`, `useSimRefuse`, `absent`, `slot`, `slots`,
-`defaultDp`, `rootDs`, `startDelayMs`, `openDelayMs`, `aid` (see the class comment).
+`defaultDp`, `rootDs`, `startDelayMs`, `openDelayMs`, `aid`, `cards`, `hangSlot`, `omapi` (see the class comment).
+`cards` puts several simulated cards in the phone, each with its own eSIMs, for example
+`{"cards":[{"slot":0},{"slot":1}],"slots":[{"euicc":true,"token":"a"},{"euicc":true,"token":"b"}]}`.
+`slots` is what Android says, not worked out from `cards`, so change both together: a card taken out is
+`{"euicc":true,"present":false}` with no token, and a card swapped for another gets a new token.
+
+`omapi` gives the emulator SIM readers for direct access (`FakeOmapi`, also in `src/debug`): while the key is
+there the app reaches the same simulated cards itself, without the helper, and otherwise uses the phone's own readers.
+Each entry is a reader, `"slot"` from 0 for SIM 1, holding the card `cards` (or `slot`) puts there. `"refuse":true`
+turns the app away, as most adapter cards and ordinary SIMs do; `"present":false` empties the reader; `"atr"` is the
+card's ATR in hex (none without it). A refusing card whose ATR says eSIM card shows as such even where the emulator
+reports an eSIM of its own, which on a real phone hides it. A 5ber in SIM 2 beside a card that lets the app in, which
+shows the "Card in SIM 2" row:
+`{"cards":[{"slot":0},{"slot":1}],"omapi":[{"slot":0},{"slot":1,"refuse":true,"atr":"3B9F96803FC7828031E073FE211B57AA8660F001001EE1"}]}`.
+An empty list is a phone with readers but none for SIM cards. Apps can read `/data/local/tmp` but not write there, so
+the app keeps its own copy of each card's state in its files, and reads whichever copy is newer: what the helper
+changes shows through direct access, but not the other way round. The files have to be readable by others
+(`chmod 644`) for the app to see them.
+
 Turn Developer options on by tapping Build number, not with `settings put`:
 otherwise Settings keeps its Developer options page disabled.
 
@@ -295,7 +369,8 @@ LinksField, ESTKme; the list is `CardShell.ISD_R_AIDS`), so a standard card neve
 tries. `OmapiApduBackend` opens the full ISD-R AID, or a maker's ID when only that one is allowed. Each
 try makes Android check the card's access rules on the card (tens of ms), so cards that
 refused every AID are remembered by ATR and skipped at later starts (Reconnect asks
-them again).
+them again). Not the ATR of the card that let the app in: two cards of one make share it, and one may refuse where the
+other doesn't.
 
 `RootApduBackend` runs `CardShell` with `su -c` and talks to it over the su
 process's own input and output; it ends with the app. `ShizukuApduBackend` does the
@@ -336,14 +411,100 @@ showing it as the card, until someone confirms it's their removable card. The pa
 still required on the tested phone because its telephony service restricts the
 full standard identifier to the system LPA.
 
+### Several cards
+
+A card is known by its EID; its slot and eSIM manager ID only say where it answers, and only for one way in, as OMAPI
+numbers Android's SIM slots and the helper physical ones. One `Lpa` object per card (`Lpa.at`) carries that address, so
+an operation, a notice run or a Details read stays on its card whatever comes into view. The card in view is found as
+before (`discover`); once its list is on screen, `Lpa.scan` looks through the other slots on the card thread, outside the
+busy gate, and only ever changes what the switcher offers, never the view, which may have a dialog or form open. A scan
+whose answer arrives after card access dropped or after someone picked a card is thrown away (`lookEpoch`).
+
+The helper's `slots` request now also says, from what Android holds in memory: `present`, `active` and `logical` (through
+ports on Android 13+, where the slot's own getters for these throw), the card's `eid` from `getUiccCardsInfo` (or a
+32-digit card ID of an eUICC), and a `token`, a short hash of the card ID that changes with the card or its active eSIM.
+Each getter is guarded on its own, and a missing field means "doesn't say", never "no". The scan costs the card nothing
+for a slot whose token is unchanged, a slot Android says is empty, or one it isn't using (opening one throws on Android
+10+). Without tokens (Android 6-8, Android 9 without root, direct access) it asks the usual ID only. An ordinary SIM that turned out to have no
+eSIM manager under any ID is remembered by way in, slot and token, until Reconnect.
+
+Android's `removable` flag is a per-tray setting from the phone's maker, not a fact about the card, so it only orders
+tries and picks words, and only counts on phones that declare the eSIM feature. The phone's own chip stays out of the
+switcher until someone says it's theirs; an inactive chip makes no row, so a tray card on an eSIM phone sees no switcher.
+
+A refresh stays at the card's own address only for a card someone chose from several (`refreshStays`): then its absence
+is what gets said, not another card's list. Everyone else's refresh looks for the card as before. The Add eSIM form has a
+target card (`addTarget`): the one in view when opened in the app, none for a code from another app while there are two
+cards, and Install waits for the first scan, so a single-use code can't go to the wrong card.
+
+After a switch or turn-off with another card's eSIM on, Android may move or clear the default data, calls and texts SIM;
+the app reads which ones the old eSIM had (public getters, Android 10+) and points to SIM settings. It never sets calls
+or texts itself. "Use for mobile data" starts ticked where mobile data is now, or where no SIM has it, and with two
+cards that tick isn't remembered.
+
+### Settings and Theme
+
+Settings is a pane of `MainActivity`, not an activity: it needs the view model, opens the panes that set things up
+(mobile data and roaming, switching to ADB), and stays open through a reconnect. The pane below it keeps its state
+(half-done setup steps, a pairing, the list's scroll) in a `SaveableStateHolder`; any other move starts a pane afresh.
+**Details** keeps only the card's own facts, and **Stop card access** sits at the bottom of Settings.
+
+**Theme** is Same as phone, Light or Dark, kept under `theme` in the `access-method` prefs, which every start reads
+anyway. Android 12 and newer keep an app's night mode themselves (`UiModeManager.setApplicationNightMode`, no
+permission), from the splash screen on and relaunching the app's screens, so nothing is read at start there; a choice
+made on Android 11 is handed over again after an update. Android 6 to 11 get it in `attachBaseContext` of
+`MainActivity` and `AboutActivity` as an override configuration with only the night bits (`fontScale = 0f`, or Android 7
+would reset the text size), and a pick recreates the screen. Compose's `isSystemInDarkTheme`, dialogs, sheets and the
+bar icons follow either way. The scanner stays dark, and `themes.xml` and the manifest don't change. On Android 6 to 11
+a cold start shows the phone's colours for a moment when they differ.
+
 ## Libraries
 
-ADB: [libadb-android](https://github.com/MuntashirAkon/libadb-android) 3.1.1. Android 11 pairing:
+ADB: [libadb-android](https://github.com/MuntashirAkon/libadb-android) 3.1.1, which brings
+[spake2-android](https://github.com/MuntashirAkon/spake2-java) 2.2.1 and Bouncy Castle 1.81 for pairing, and Bouncy Castle's
+Base64 for sending the ADB key. Android 11 pairing:
 [HiddenApiBypass](https://github.com/LSPosed/AndroidHiddenApiBypass) 4.3. Shizuku client:
 [Shizuku-API](https://github.com/RikkaApps/Shizuku-API) 13.1.5. QR codes: [ZXing](https://github.com/zxing/zxing) core 3.5.4,
 and in the google build the
 [Google code scanner](https://developers.google.com/ml-kit/vision/barcode-scanning/code-scanner) 16.1.0.
 
-The app's own code is under the [MIT License](../LICENSE). The libraries keep their own: libadb-android is
-GPL-3.0-or-later or Apache-2.0, with an LGPL dependency, HiddenApiBypass and ZXing are Apache-2.0, and Shizuku-API is MIT.
-Their licence texts have to reach people with the APK, which the app doesn't do yet.
+The app's own code is under the [MIT License](../LICENSE). The libraries keep their own, and the "Libraries & licenses"
+page, linked from About, shows them, with their texts or, for Google's ML Kit terms, a link, so they reach people with the
+APK:
+
+- `ui/Licenses.kt` lists the rows. The google build adds its own through `QrScan.LIBRARIES`.
+- `assets/licenses` holds the texts, in `src/main` and in `src/google`. They're read only when someone opens one.
+- libadb-android is GPL-3.0-or-later or Apache-2.0, and the app takes Apache-2.0. Four of its files are also BSD-3-Clause
+  and one MIT.
+- spake2-android is LGPL-3.0, so its notice links its source and this project's. Its native library has ISC, MIT, LGPL-2.1
+  and Apache-2.0 parts. The GPL's text is there because the LGPL builds on it.
+- Bouncy Castle has its own MIT-style license. Shizuku-API is MIT. HiddenApiBypass, ZXing, Compose, AndroidX, Kotlin and
+  Material Icons (most of `res/drawable`) are Apache-2.0. ZXing and kotlinx have NOTICE files. Kotlinx's is in its
+  repository at `license/NOTICE.txt`, not in the jar, so a bump has to look there.
+- Google's own libraries come under the ML Kit Terms of Service and the Android SDK License, its Firebase and Data
+  Transport ones under Apache-2.0, and they carry notices for what's inside them. `google-third-party.txt` merges their
+  `third_party_licenses.{json,txt}`, each entry once. Entries that are only the Apache License are a list of names, and
+  the rest stay word for word. It adds about 63 KB to the google APK.
+
+`LicensesTest` fails when a direct dependency's version no longer matches its row. On a bump, read that library's license
+and NOTICE at the new version, and its dependencies': `:app:dependencies --configuration standaloneReleaseRuntimeClasspath`,
+and the same for `googleReleaseRuntimeClasspath`. The APK has no other license files: AGP drops most of them, and the build
+drops AndroidX's copies.
+
+### Building with a changed spake2-android
+
+Its license lets people rebuild the app with their own version of it. Its native part is a separate file in the APK, but
+its Java part is minified into the app's code, so that takes this project's source:
+
+1. Get its source, with the native part as a submodule:
+   `git clone --recursive --branch 2.2.1 https://github.com/MuntashirAkon/spake2-java.git`. Build it with its own Gradle
+   wrapper, `:android:assembleRelease`, which needs the NDK and CMake.
+2. Put the AAR in `app/libs`, and in `app/build.gradle.kts` replace the libadb-android line with:
+
+   ```kotlin
+   implementation("com.github.MuntashirAkon:libadb-android:3.1.1") { exclude(group = "com.github.MuntashirAkon.spake2-java") }
+   implementation(files("libs/spake2-android-release.aar"))
+   ```
+
+3. Build as under "Build and checks". Your APK has its own signature, so it can't install over a release: uninstall the
+   app first, which also loses the pairing.

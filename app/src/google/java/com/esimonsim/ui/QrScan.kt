@@ -31,6 +31,14 @@ object QrScan {
     const val NETWORK_NOTE: String =
         " The QR scanner is Google Play services' scanner, which also sends Google usage statistics about it."
 
+    /** Added to the Licenses page: Google's libraries, with the notices they carry for what's inside them. */
+    internal val LIBRARIES = listOf(
+        Library("Google code scanner 16.1.0", "Google's terms", listOf("google-terms.txt")),
+        Library("Firebase and Data Transport", "Apache-2.0", listOf(APACHE),
+            "Firebase components and encoders, Google Data Transport and javax.inject."),
+        Library("Notices from Google's libraries", "Several", listOf("google-third-party.txt", APACHE)),
+    )
+
     /** startScan() fails at once (code 207) below Play services 22.15. */
     private const val MIN_VERSION = 221_500_000
     /** The Play services screen that ML Kit's own (invisible) activity starts. */

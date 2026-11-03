@@ -13,6 +13,8 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -37,6 +39,9 @@ public final class CardShell implements HelperServer.Session {
     private static final long UNCLAIMED_MS = 30_000;
     /** No subscription to reach a slot's card through (see {@link #subIdFor}). */
     private static final int NO_SUB = Integer.MIN_VALUE;
+    /** UiccSlotInfo.CARD_STATE_INFO_ABSENT. */
+    private static final int CARD_ABSENT = 1;
+    private static final Pattern EID = Pattern.compile("[0-9]{32}");
     private static final Class<?> I = int.class, S = String.class;
 
     /** The eSIM manager IDs a request may open, the usual one first: most cards answer to it, and some makers' only
@@ -453,7 +458,7 @@ public final class CardShell implements HelperServer.Session {
         thread.start();
     }
 
-    /** Read-only: whether each physical slot holds an eUICC, and whether Android counts it removable. Empty when
+    /** Read-only: what Android says of each physical slot, from what it holds in memory: no card is touched. Empty when
      * Android doesn't say: 6-8 have no such list, and 9 lets only root read it. */
     private JSONObject slots(JSONObject out) throws Exception {
         JSONArray list = new JSONArray();
@@ -461,6 +466,7 @@ public final class CardShell implements HelperServer.Session {
             Object[] all;
             try { all = (Object[]) phoneCall("getUiccSlotsInfo", SHELL); } // Android 13+
             catch (NoSuchMethodException e) { all = (Object[]) phoneCall("getUiccSlotsInfo"); } // Android 9-12L
+            Map<Integer, String> eids = all == null ? Collections.emptyMap() : cardEids();
             for (int i = 0; all != null && i < all.length; i++) {
                 Object s = all[i];
                 JSONObject slot = new JSONObject();
@@ -470,6 +476,7 @@ public final class CardShell implements HelperServer.Session {
                     // end of the search on a guess.
                     Method removable = find(s.getClass(), "isRemovable");
                     if (removable != null) slot.put("removable", (boolean) removable.invoke(s));
+                    describe(slot, s, eids.get(i));
                 }
                 list.put(slot);
             }
@@ -478,6 +485,61 @@ public final class CardShell implements HelperServer.Session {
             list = new JSONArray();
         }
         return out.put("slots", list);
+    }
+
+    /** The rest of what a slot says, field by field: each is left out if Android doesn't have it or its getter fails, as
+     * one bad getter on some phone mustn't cost the whole list, and the app reads a missing field as unknown. */
+    private static void describe(JSONObject slot, Object s, String cardEid) throws Exception {
+        Object state = get(s, "getCardStateInfo");
+        if (state instanceof Integer) slot.put("present", (int) state != CARD_ABSENT);
+        Object ports = get(s, "getPorts");
+        if (ports instanceof Iterable) { // Android 13+, where the slot's own two getters below throw
+            for (Object port : (Iterable<?>) ports) {
+                Object on = get(port, "isActive");
+                if (on instanceof Boolean && !slot.optBoolean("active")) {
+                    slot.put("active", on);
+                    if ((boolean) on) putLogical(slot, get(port, "getLogicalSlotIndex"));
+                }
+            }
+        } else {
+            Object on = get(s, "getIsActive");
+            if (on instanceof Boolean) {
+                slot.put("active", on);
+                if ((boolean) on) putLogical(slot, get(s, "getLogicalSlotIdx"));
+            }
+        }
+        // The EID when Android has it, but also just the active eSIM's ICCID, or an ordinary SIM's: never sent as it is.
+        Object id = get(s, "getCardId");
+        String cardId = id instanceof String ? (String) id : "";
+        String eid = cardEid != null ? cardEid : slot.optBoolean("euicc") ? cardId : "";
+        if (EID.matcher(eid).matches()) slot.put("eid", eid);
+        if (!cardId.isEmpty()) slot.put("token", hex(Arrays.copyOf(
+                MessageDigest.getInstance("SHA-256").digest(cardId.getBytes(StandardCharsets.UTF_8)), 8)));
+    }
+
+    private static void putLogical(JSONObject slot, Object logical) throws Exception {
+        if (logical instanceof Integer && (int) logical >= 0) slot.put("logical", logical);
+    }
+
+    /** The card IDs Android 10+ has read, by physical slot. Not vital, so never a reason to give up the list. */
+    private Map<Integer, String> cardEids() throws Exception {
+        Map<Integer, String> eids = new HashMap<>();
+        try {
+            Object cards = phoneCall("getUiccCardsInfo", SHELL);
+            if (cards instanceof Iterable) for (Object card : (Iterable<?>) cards) {
+                Object slot = get(card, "getSlotIndex"), eid = get(card, "getEid");
+                if (slot instanceof Integer && eid instanceof String) eids.put((Integer) slot, (String) eid);
+            }
+        } catch (Exception e) { if (phoneDied(e)) throw e; }
+        return eids;
+    }
+
+    /** [target]'s getter, or null when there's no such getter or it fails. */
+    private static Object get(Object target, String getter) {
+        try {
+            Method method = find(target.getClass(), getter);
+            return method == null ? null : method.invoke(target);
+        } catch (Exception e) { return null; }
     }
 
     private Object phone() throws Exception {

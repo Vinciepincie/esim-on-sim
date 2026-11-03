@@ -18,6 +18,7 @@ import com.esimonsim.apdu.AccessMethod
 import com.esimonsim.apdu.AllowNeededException
 import com.esimonsim.apdu.ApduException
 import com.esimonsim.apdu.CardAccess
+import com.esimonsim.apdu.ConnectCancelledException
 import com.esimonsim.apdu.DebuggingPortClosedException
 import com.esimonsim.apdu.NearbyDevicesNeededException
 import com.esimonsim.apdu.PairingRequiredException
@@ -33,6 +34,7 @@ import com.esimonsim.lpa.AlreadyOnCardException
 import com.esimonsim.lpa.ConfirmationCodeNeededException
 import com.esimonsim.lpa.EuiccProfile
 import com.esimonsim.lpa.Lpa
+import com.esimonsim.lpa.SlotLook
 import com.esimonsim.lpa.SlotReach
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
@@ -50,6 +52,9 @@ enum class AccessStatus { SETUP, CONNECTING, READY }
  *  [cancellable]: it only reads the card, so it can stop early; [cancelling] once asked to. */
 data class Busy(val label: String, val progress: Float? = null, val step: Lpa.Step? = null,
                 val cancellable: Boolean = false, val cancelling: Boolean = false)
+
+/** What [LpaViewModel.priorInstall] found. */
+data class PriorInstall(val install: ProfileStore.Install, val onCard: EuiccProfile?, val onOther: CardRow?)
 
 /** An activation code this app installed before; installing waits for the user's answer. */
 data class DuplicateCode(
@@ -83,7 +88,7 @@ data class LpaUi(
     /** Android 17: finding Wireless debugging's new port needs "Nearby devices", which this app may not use yet. */
     val nearbyNeeded: Boolean = false,
     /** Direct card access, Android 10 and older: a switch couldn't set mobile data and roaming because the phone no
-     *  longer allows this app's debugging access. Details › Mobile data and roaming allows it again. */
+     *  longer allows this app's debugging access. Settings › Mobile data and roaming allows it again. */
     val simAllowNeeded: Boolean = false,
     /** How often [LpaViewModel.setUpSimSettings] succeeded, so its screen can close when it does. */
     val simSettingsSetUps: Int = 0,
@@ -95,6 +100,20 @@ data class LpaUi(
     val helperUnavailable: Boolean = false,
     /** How the card is reached: the way that worked last, also while card access is stopped. Null before any did. */
     val method: AccessMethod? = null,
+    /** The way chosen in this app's Settings, which connecting tries first; null: none, so the order is automatic. */
+    val preferred: AccessMethod? = null,
+    /** Why card access isn't through [preferred] (see [CardAccess.preferredFailure]). */
+    val preferredFailure: Exception? = null,
+    /** The last try at direct access was turned down by the card, not just slow or empty. */
+    val directRefused: Boolean = false,
+    /** Direct access is worth offering on this phone ([CardAccess.directAvailable]). Read off the main thread. */
+    val directAvailable: Boolean = false,
+    /** Two or more SIM slots, so a card that direct access can't open may sit in another. Read off the main thread. */
+    val multiSim: Boolean = false,
+    /** The pane that sets up ADB to switch card access to it is open. The way in use carries on meanwhile. */
+    val accessSetup: Boolean = false,
+    /** How often card access switched while connected, so Settings opened just for that can close once it did. */
+    val accessSwitches: Int = 0,
     /** The phone's SIM settings can follow a switch; with direct access only through Shizuku or a pairing. */
     val canSetUpSim: Boolean = true,
     /** This phone has an su the app might use, and whether root was turned down for it. */
@@ -110,9 +129,17 @@ data class LpaUi(
     val busy: Busy? = null,
     val eid: String? = null,
     val slot: Int = -1,
+    /** The number the phone goes by for [slot], from 0, once a look through the slots has said; -1 before. */
+    val sim: Int = -1,
+    /** A line per card in the phone, the one in view among them. As last looked: [rows] has the one in view up to date. */
+    val cards: List<CardRow> = emptyList(),
+    /** The first look through the slots since card access came up is still going: another card may yet turn up. */
+    val lookingForCards: Boolean = true,
     /** The EID of the phone's own built-in eSIM chip, the only one found: held back, so [eid] stays null, until people
      *  say it's their removable card. */
     val builtInChip: String? = null,
+    /** With [builtInChip]: another slot holds a card the phone isn't using, likely the one people are looking for. */
+    val idleSlot: Int = -1,
     /** Active profile first. */
     val profiles: List<EuiccProfile> = emptyList(),
     /** Notes saved on this phone, by ICCID. */
@@ -144,6 +171,9 @@ data class LpaUi(
     /** The provider wanted a confirmation code for this eSIM and got none: the form opens its field. */
     val ccNeeded: ActivationCode? = null,
     val duplicate: DuplicateCode? = null,
+    /** Which card the Add eSIM form installs on, when there are several: the one in view if it was opened in the app; a
+     *  code from another app has none until people pick. Never a guess: an activation code often works only once. */
+    val addTarget: String? = null,
     /** Just downloaded; the UI offers to name it and switch to it. */
     val installed: EuiccProfile? = null,
     /** Last chosen in the switch dialog: whether the phone's SIM settings follow a switch. */
@@ -159,38 +189,92 @@ data class LpaUi(
     val usbTip get() = method == AccessMethod.ADB && background && !settings.legacy &&
         settings.usbDebugging != true && settings.wirelessDebugging != false && profiles.any { !it.enabled }
 
+    val rows get() = withView(cards, slot, eid, profiles, sim)
+    /** Cards this app can open, unlike one in a slot the phone isn't using. */
+    val manageable get() = cards.count { it.eid != null }
+    /** The SIM numbers, from 1, of eSIM cards that direct access can't open ([CardRow.locked]). */
+    val lockedSims get() = cards.filter { it.locked }.map { it.sim + 1 }
+    /** What the card switcher offers. Under the Add eSIM form, no card only another way in opens: that switch would
+     *  go on under the form. */
+    val menuRows get() = if (adding || installed != null) rows.filterNot { it.locked } else rows
+    val switcher get() = cards.size >= 2 && (!adding || cards.count { !it.locked } >= 2)
+    /** The SIM number people know the card in view by, from 1. */
+    val simNumber get() = (if (sim >= 0) sim else slot) + 1
+    /** Android's own number for [slot], from 0, or -1: only OMAPI's slots are Android's, and the helper says otherwise. */
+    val androidSlot get() = if (sim >= 0) sim else if (method == AccessMethod.DIRECT) slot else -1
+    /** The Add eSIM form waits for people to say which card: there are several and none was chosen, or the one chosen
+     *  isn't the one in view any more. Never a guess, as an activation code often works only once. */
+    val pickCard get() = !loading && if (addTarget == null) manageable >= 2 else eid != null && eid != addTarget
+    /** The card to install on is settled. For the form's button and the install itself, so nothing gets round it. */
+    val mayInstall get() = eid != null && !loading && !lookingForCards &&
+        (if (addTarget == null) manageable < 2 else eid == addTarget)
+
     /** The provider wants a confirmation code for [ac]: to the form that's a failed install like any other. */
     fun ccAsked(ac: ActivationCode) = copy(ccNeeded = ac, keepDraft = true)
 
     /** The Add eSIM form opening. A kept one still has the code the provider asked about, so its ask stays too and
      *  Install waits for the answer; trying again without it would only go back to the provider to be asked again. */
-    fun addOpened() = copy(adding = true, ccNeeded = ccNeeded.takeIf { keepDraft }, duplicate = null, keepDraft = false)
+    fun addOpened(target: String? = eid) = copy(adding = true, ccNeeded = ccNeeded.takeIf { keepDraft }, duplicate = null,
+        keepDraft = false, addTarget = target)
 }
 
 class LpaViewModel(app: Application, private val saved: SavedStateHandle) : AndroidViewModel(app) {
     private val backend = CardAccess(app)
     // The feature exists from Android 9; older phones simply don't report it. Below Android 10 the helper reaches the
     // card through Android's older calls, which can't name every SIM slot (see SlotReach); OMAPI can.
+    /** The card in view. Moves only on the main thread and behind [working], so work behind that gate can just read it;
+     *  what runs outside it (notices, Details) takes it first. */
     @SuppressLint("InlinedApi")
-    private val lpa = Lpa(backend, phoneHasEsim = app.packageManager.hasSystemFeature(PackageManager.FEATURE_TELEPHONY_EUICC),
+    @Volatile private var lpa = Lpa(backend, phoneHasEsim = app.packageManager.hasSystemFeature(PackageManager.FEATURE_TELEPHONY_EUICC),
         slotReach = { if (Build.VERSION.SDK_INT >= 29 || backend.method == AccessMethod.DIRECT) SlotReach.ALL
             else if (Build.VERSION.SDK_INT >= 24) SlotReach.FIRST_OR_ACTIVE else SlotReach.FIRST_ONLY },
         accessRulesApply = { backend.method == AccessMethod.DIRECT })
     private val store = ProfileStore(app)
+
+    /** A card not in view: [lpa] reaches it, and [profiles] are its eSIMs as last read, if they could be. */
+    private class Kept(val lpa: Lpa, val profiles: List<EuiccProfile>?)
+    // On the main thread only, like what goes with them.
+    private var kept = emptyMap<String, Kept>()
+    /** The way in that the addresses in [lpa] and [kept] are for. */
+    private var cardsVia: AccessMethod? = null
+    /** [com.esimonsim.apdu.SlotInfo.token]s already looked behind, since card access came up. */
+    private var seen = emptyMap<Int, String>()
+    /** The number the phone goes by for each slot, as the last look said, for the way in [cardsVia]. Kept when card
+     *  access drops, so a card that comes back keeps its number before the next look has said it. */
+    private var simOf = emptyMap<Int, Int>()
+    /** Slots a look lost card access to. Coming back to them would drop it again and again: only Reconnect tries them. */
+    private var hungSlots = emptySet<Int>()
+    /** Goes up when what a look is based on no longer holds. It looks outside [working], or every tap in the meantime
+     *  would do nothing, so its answer can arrive after that. */
+    private var lookEpoch = 0
+    private var looking: Job? = null
+    /** Where the view goes once card access switched to another way, when the next look has found the cards that way. */
+    private var landing: Landing? = null
+    /** The SIM (from 0) of the card the pane for switching to ADB was opened for, or -1: see [chooseAccess]. */
+    private var switchFor = -1
+    /** Read once, off the main thread, for Settings: nobody else needs it. */
+    private val multiSim by lazy { simSlots(app) >= 2 }
     // PairingFlow outlives this: a pairing from before it doesn't count as a new one below.
     private val _ui = MutableStateFlow(LpaUi(paired = backend.wasPaired, settings = DebugSettings.read(app),
-        pairing = PairingFlow.state.value, stopped = store.stopped(),
+        pairing = PairingFlow.state.value, stopped = store.stopped(), preferred = backend.preferred,
         helperUnavailable = backend.helperUnavailable, method = backend.method, rootFound = backend.rootFound,
         rootDeclined = backend.rootDeclined, notes = store.notes(), dismissedSameName = store.dismissedSameName(), hidden = store.hidden(),
         usbTipDismissed = store.usbTipDismissed(), noSim = noSimInPhone(app),
         switchSetup = store.switchSetup(),
-        incoming = saved[INCOMING], adding = saved[ADDING] ?: false))
+        incoming = saved[INCOMING], adding = saved[ADDING] ?: false, addTarget = saved[ADD_TARGET]))
     val ui: StateFlow<LpaUi> = _ui.asStateFlow()
     private val working get() = _ui.value.let { it.loading || it.busy != null || it.access == AccessStatus.CONNECTING }
 
     init {
         // Android can stop the app while people fetch a code from their email: the typed form comes back with this.
         viewModelScope.launch { _ui.map { it.adding }.distinctUntilChanged().collect { saved[ADDING] = it } }
+        viewModelScope.launch { _ui.map { it.addTarget }.distinctUntilChanged().collect { saved[ADD_TARGET] = it } }
+        viewModelScope.launch {
+            _ui.map { it.access }.distinctUntilChanged().collect {
+                // A switch needs the way in use to carry on meanwhile.
+                if (it != AccessStatus.READY) { forgetCards(); landing = null; _ui.update { u -> u.copy(accessSetup = false) } }
+            }
+        }
         viewModelScope.launch { _ui.map { it.stopped }.distinctUntilChanged().drop(1).collect { store.setStopped(it) } }
         // Settings are read directly, so a switched-off Wireless debugging shows at once instead of
         // after a failed connection attempt; and the app connects as soon as it is switched on.
@@ -209,8 +293,16 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
                 val newlyPaired = p.pairedCount > _ui.value.pairing.pairedCount
                 _ui.update { it.copy(pairing = p, paired = it.paired || newlyPaired,
                     pairingExpired = it.pairingExpired && !newlyPaired) }
-                // Also just for SIM settings, with direct card access: the switch dialog offers them from now on.
-                if (newlyPaired) { _ui.update { it.copy(stopped = false, canSetUpSim = backend.canSetUpSim) }; autoConnect(justPaired = true) }
+                // Also just for SIM settings, with direct card access: the switch dialog offers them from now on. Or
+                // paired to switch card access to Wireless debugging: that's next.
+                if (newlyPaired) {
+                    _ui.update { it.copy(stopped = false, canSetUpSim = backend.canSetUpSim) }
+                    // After whatever the card is doing, such as a refresh: the pairing was for this.
+                    if (_ui.value.accessSetup) launch {
+                        _ui.first { !it.loading && it.busy == null }
+                        if (_ui.value.accessSetup) finishAccessSetup()
+                    } else autoConnect(justPaired = true)
+                }
             }
         }
         viewModelScope.launch {
@@ -241,6 +333,8 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
             val key = withContext(Dispatchers.IO) { runCatching { AdbIdentity.fingerprint(app) }.getOrNull() }
             _ui.update { it.copy(adbKey = key) }
         }
+        // Android keeps the Theme setting from 12 on; a phone updated from 11 has it only here (see ThemeSetting).
+        if (Build.VERSION.SDK_INT >= 31) viewModelScope.launch(Dispatchers.IO) { ThemeSetting.resync(app) }
         autoConnect()
     }
 
@@ -262,6 +356,8 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
             noSim = noSimInPhone(getApplication())) }
         autoConnect()
         refreshShizuku()
+        // A card put in meanwhile. Android keeps the slot list in memory, so this costs the card nothing.
+        if (!working) lookForCards(quick = true)
     }
 
     private var firstResume = true
@@ -271,7 +367,8 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
     private var inApp = true
 
     /** Shizuku's state, and connecting if it just became usable. Started in or allowed from Shizuku's own app, this
-     *  often only shows on return to this app: that sends no word. */
+     *  often only shows on return to this app: that sends no word. Also what Settings shows that costs a call to read,
+     *  and what the last connection found out about the ways in. */
     private fun refreshShizuku() {
         viewModelScope.launch {
             val appeared = withContext(Dispatchers.IO) {
@@ -279,7 +376,11 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
                 val status = backend.shizukuStatus
                 val canSetUpSim = backend.canSetUpSim
                 val asking = backend.shizukuAsking
-                _ui.update { it.copy(shizuku = status, canSetUpSim = canSetUpSim, shizukuAsking = asking) }
+                val direct = backend.directAvailable
+                val slots = multiSim
+                _ui.update { it.copy(shizuku = status, canSetUpSim = canSetUpSim, shizukuAsking = asking,
+                    directAvailable = direct, multiSim = slots, directRefused = backend.directRefused,
+                    preferredFailure = backend.preferredFailure) }
                 appeared
             }
             if (appeared) shizukuPending = true
@@ -313,12 +414,18 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
     }
 
     /** "Reconnect": every way in again, the ones ruled out earlier included. On Android 10 and older also the
-     *  first connection after setup, which the phone asks to allow. */
-    fun connect(portText: String = "") {
+     *  first connection after setup, which the phone asks to allow. [forAdb]: tapped on ADB's own screens, so the
+     *  phone may ask also behind a way chosen in this app's Settings (see [CardAccess.connect]). */
+    fun connect(portText: String = "", forAdb: Boolean = true) {
         if (working) return
         val port = if (portText.isBlank()) null else parsePort(portText) ?: return
         _ui.update { it.copy(stopped = false) }
-        startConnection(askingAllow = Build.VERSION.SDK_INT < 30) { backend.connect(port, again = true) }
+        hungSlots = emptySet()
+        store.clearNoManagers()
+        val asks = forAdb || port != null || backend.preferred == null || backend.preferred == AccessMethod.ADB
+        startConnection(askingAllow = Build.VERSION.SDK_INT < 30 && asks) {
+            backend.connect(port, again = true, forAdb = forAdb)
+        }
     }
 
     /** "Check again" on first-run setup, for a card put in since: never ADB, so nothing is asked of the phone, but
@@ -344,7 +451,7 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
         viewModelScope.launch(Dispatchers.IO) { backend.cancelConnect() }
     }
 
-    /** Details › Mobile data and roaming with direct card access, on Android 10 and older: the first
+    /** Settings › Mobile data and roaming with direct card access, on Android 10 and older: the first
      *  connection over ADB, which the phone asks to allow; or the one after the phone forgot it. Card access
      *  itself stays direct. */
     fun setUpSimSettings() {
@@ -367,13 +474,17 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
     }
 
     /** "Use Shizuku": asks it to allow this app, also after a refusal. With direct card access, which stays, it's only
-     *  for mobile data and roaming: the card would be reached directly again at the next start anyway. */
+     *  for mobile data and roaming: the card would be reached directly again at the next start anyway. Not connected,
+     *  it replaces a way chosen in this app's Settings once it worked; under Automatic it stays automatic. */
     fun useShizuku() {
         if (working) return
         allowCancelled = false
         if (_ui.value.access != AccessStatus.READY) {
             _ui.update { it.copy(stopped = false) }
-            return startConnection(ready = "Card access now uses Shizuku") { backend.useShizuku() }
+            return startConnection(ready = "Card access now uses Shizuku") {
+                backend.useShizuku()
+                if (backend.preferred != null) backend.prefer(AccessMethod.SHIZUKU)
+            }
         }
         _ui.update { it.copy(busy = Busy("Waiting for Shizuku…", cancellable = true), error = null, errorTitle = null,
             info = null) }
@@ -390,23 +501,167 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
     }
 
     /** "Use root": asks the phone's root app again, e.g. after root was turned down once. Card access that works
-     *  now (directly, say) carries on if root is refused. */
+     *  now (directly, say) carries on if root is refused. A way chosen in this app's Settings is replaced once root
+     *  worked; under Automatic it stays automatic. */
     fun useRoot() {
         if (working) return
         if (_ui.value.access != AccessStatus.READY) {
             _ui.update { it.copy(stopped = false) }
-            return startConnection(ready = "Card access now uses root") { backend.connectRoot() }
+            return startConnection(ready = "Card access now uses root") {
+                backend.connectRoot()
+                if (backend.preferred != null) backend.prefer(AccessMethod.ROOT)
+            }
         }
-        _ui.update { it.copy(busy = Busy("Asking for root…"), error = null, errorTitle = null, info = null) }
+        switchAccess(AccessMethod.ROOT, save = backend.preferred != null)
+    }
+
+    // ---------------- choosing card access (Settings) ----------------
+
+    /** [way] picked in this app's Settings › Card access; null for Automatic. Connected, card access switches to it, and
+     *  only once that worked is it kept: a failed switch changes nothing. Not connected there's nothing to lose, so it's
+     *  kept at once, and connecting tries it first. [fromSim]: picked for the card in that SIM (from 0), which direct
+     *  access can't open: it comes into view after the switch. Shizuku that isn't running, and "Nearby devices" on
+     *  Android 17, are the screen's to deal with first. */
+    fun chooseAccess(way: AccessMethod?, fromSim: Int = -1) {
+        val ui = _ui.value
+        // Settings closes for the Add eSIM form, and its rows are off while a pairing runs.
+        if (ui.adding || ui.installed != null || PairingFlow.state.value.active) return
+        if (working || CardWork.active.value) return _ui.update { it.copy(info = "Wait for the card to finish, then try again.") }
+        val sdk = Build.VERSION.SDK_INT
+        val unset = way == AccessMethod.ADB && !backend.wasPaired && !backend.hasHelper
+        if (ui.access != AccessStatus.READY) {
+            // Only news when it changed: the selected row again just tries again.
+            val said = switched(way, null).takeIf { way != ui.preferred }
+            backend.prefer(way)
+            _ui.update { it.copy(preferred = way, preferredFailure = null, stopped = false) }
+            // ADB's setup screens are what's next; Shizuku connects by itself once it's started.
+            if (unset || (way == AccessMethod.SHIZUKU && ui.shizuku == ShizukuStatus.STOPPED)) return
+            failedWith = null
+            // On Android 10 and older the phone may ask to allow ADB, where it isn't behind another way.
+            return startConnection(askingAllow = sdk < 30 && (way == null || way == AccessMethod.ADB), ready = said,
+                via = way) { backend.connect(again = true) }
+        }
+        when {
+            way == ui.method && way == ui.preferred -> {}
+            way == null && ui.preferred == null -> {}
+            // In use already: only the choice is new.
+            way != null && way == ui.method -> {
+                backend.prefer(way)
+                _ui.update { it.copy(preferred = way, preferredFailure = null, info = switched(way, way)) }
+            }
+            // Nothing to connect to yet: set up first, while the way in use carries on.
+            way == AccessMethod.ADB && (unset || ui.pairingExpired) -> {
+                switchFor = fromSim
+                _ui.update { it.copy(accessSetup = true) }
+            }
+            else -> switchAccess(way, save = true, fromSim)
+        }
+    }
+
+    /** The pane for switching card access to ADB is done: paired (the pairing flow calls this), or on Android 10 and
+     *  older set up with a computer, [portText] being the port typed after "adb tcpip", if not the usual one. */
+    fun finishAccessSetup(portText: String = "") {
+        val port = if (portText.isBlank()) null else parsePort(portText) ?: return
+        switchAccess(AccessMethod.ADB, save = true, switchFor, port)
+    }
+
+    /** Closes that pane: card access stays as it is. */
+    fun closeAccessSetup() {
+        cancelPairing()
+        _ui.update { it.copy(accessSetup = false) }
+    }
+
+    /** A setup screen's "instead" ("Set up Wireless debugging instead") for [way]: a way chosen in this app's Settings is
+     *  replaced, as that's what it says. Under Automatic nothing is chosen, so that stays. */
+    fun preferIfChosen(way: AccessMethod) {
+        if (backend.preferred == null || backend.preferred == way) return
+        backend.prefer(way)
+        _ui.update { it.copy(preferred = way, preferredFailure = null) }
+    }
+
+    /** Card access through [way] from now on, while connected (see [CardAccess.switchTo]): the way in use carries on
+     *  until that one works, and if it doesn't. With [save] it's also the choice in this app's Settings. [fromSim]: see
+     *  [chooseAccess]. [port]: ADB on the port people typed (Android 10 and older). */
+    private fun switchAccess(way: AccessMethod?, save: Boolean, fromSim: Int = -1, port: Int? = null) {
+        if (working || _ui.value.access != AccessStatus.READY) return
+        val sdk = Build.VERSION.SDK_INT
+        val before = backend.method
+        allowCancelled = false
+        // It holds the card thread between slots, and stops at the next one; the switch finds the cards again anyway.
+        looking?.cancel()
+        // The questions can be stopped waiting for, and so can the search for Wireless debugging.
+        _ui.update { it.copy(busy = Busy(switching(way, sdk), cancellable = way == AccessMethod.SHIZUKU ||
+            way == AccessMethod.ADB), error = null, errorTitle = null, info = null) }
         viewModelScope.launch {
-            val error = try { withContext(cardDispatcher) { backend.connectRoot() }; null }
-                catch (e: CancellationException) { throw e } catch (e: Exception) { e }
-            _ui.update { it.copy(busy = null, method = backend.method, canSetUpSim = backend.canSetUpSim,
-                background = backend.inBackground, rootFound = backend.rootFound, rootDeclined = backend.rootDeclined,
-                info = if (error == null) "Card access now uses root" else error.message ?: "Root access wasn't granted.") }
-            // Root numbers SIM slots its own way: find the card again before anything else uses it.
-            if (error == null) loadCard()
+            val error = try {
+                // Cancel lets go of the new way even once it connected: nothing changes, and nothing is saved.
+                withContext(cardDispatcher) { backend.switchTo(way, port) { allowCancelled }; if (save) backend.prefer(way) }
+                null
+            } catch (e: CancellationException) { throw e } catch (e: Exception) { e }
+            val adb = backend.method == AccessMethod.ADB
+            _ui.update { it.copy(busy = null, method = backend.method, preferred = backend.preferred,
+                preferredFailure = backend.preferredFailure, canSetUpSim = backend.canSetUpSim,
+                background = backend.inBackground, paired = backend.wasPaired, helperUnavailable = backend.helperUnavailable,
+                rootFound = backend.rootFound, rootDeclined = backend.rootDeclined, directRefused = backend.directRefused) }
+            if (error == null) {
+                if (PairingFlow.state.value.active) PairingFlow.stop(getApplication()) // the pairing was for this
+                // Slots that hung for the way before are just numbers to this one, and the card may be elsewhere now.
+                hungSlots = emptySet()
+                val inView = _ui.value.eid
+                landing = if (fromSim >= 0) Landing.Other(inView, fromSim) else inView?.let { Landing.Keep(it) }
+                _ui.update { it.copy(stopped = false, accessSetup = false, accessSwitches = it.accessSwitches + 1,
+                    pairingExpired = it.pairingExpired && !adb, portClosed = false, allowAgain = false,
+                    nearbyNeeded = it.nearbyNeeded && !adb, simAllowNeeded = it.simAllowNeeded && !adb) }
+                refreshShizuku()
+                // Each way in numbers slots its own way: this finds the card again before anything else uses it.
+                return@launch loadCard(switched(way, before))
+            }
+            val body = if (allowCancelled || (error is AllowNeededException && error.cancelled)) null
+                else switchError(way, error, sdk, DebugSettings.read(getApplication()).mayConnect)
+            // The pane says what these need, and it opens for them.
+            val setUp = error is PairingRequiredException || error is DebuggingPortClosedException
+            _ui.update { it.copy(pairingExpired = it.pairingExpired || error is PairingRequiredException,
+                nearbyNeeded = it.nearbyNeeded || error is NearbyDevicesNeededException,
+                portClosed = it.portClosed || error is DebuggingPortClosedException,
+                accessSetup = it.accessSetup || setUp, errorTitle = body?.let { _ -> switchTitle(way, sdk) },
+                error = body?.let { b -> "$b\n\nCard access stays as it was." }) }
+            if (setUp) switchFor = fromSim
+            refreshShizuku()
+            lookForCards() // what the switch stopped
         }
+    }
+
+    /** What the busy dialog says while card access switches to [way]: what may take a moment there. */
+    private fun switching(way: AccessMethod?, sdk: Int) = when (way) {
+        null -> "Connecting to your card…"
+        AccessMethod.DIRECT -> "Checking your card…"
+        AccessMethod.ROOT -> "Asking for root…"
+        AccessMethod.SHIZUKU -> "Waiting for Shizuku…"
+        AccessMethod.ADB -> if (sdk >= 30) "Connecting to Wireless debugging…" else "Waiting for your phone to allow this app…"
+    }
+
+    /** What a switch to [way] says once it worked. [before]: the way in use until then, so Automatic can say whether
+     *  that changed. */
+    private fun switched(way: AccessMethod?, before: AccessMethod?): String {
+        val sdk = Build.VERSION.SDK_INT
+        return when (way) {
+            null -> "Card access is automatic again" + (backend.method?.takeIf { before != null && it != before }
+                ?.let { ". Now using ${wayName(it, sdk, backend.inBackground)}." } ?: "")
+            AccessMethod.DIRECT -> "This app now reaches your card directly"
+            AccessMethod.ROOT -> "Card access now uses root"
+            AccessMethod.SHIZUKU -> "Card access now uses Shizuku"
+            AccessMethod.ADB -> "Card access now uses ${if (sdk >= 30) "Wireless debugging" else "USB debugging"}"
+        }
+    }
+
+    /** Said on the setup screens when the way chosen in this app's Settings failed, and they're about another one
+     *  (see SetupScreen): what was chosen, and why it didn't work. Their own text is about the other. */
+    private fun chosenNote(): String? {
+        val chosen = backend.preferred?.takeIf { it != AccessMethod.ADB && it != backend.method } ?: return null
+        val e = backend.preferredFailure?.takeIf { it !== CardAccess.NotTried } ?: return null
+        val sdk = Build.VERSION.SDK_INT
+        return "You chose ${wayLabel(chosen, sdk)} in this app's Settings, but " +
+            "${fallbackWhy(e, chosen, sdk, backend.wasPaired, _ui.value.shizuku != ShizukuStatus.ABSENT)}."
     }
 
     // ---------------- pairing ----------------
@@ -437,9 +692,10 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
 
     /** [askingAllow]: the phone may ask to allow this app meanwhile, so the Connecting screen says what to do.
      *  [portMayOpen]: with [retry], a closed debugging port (Android 10 and older) is retried too, since USB
-     *  debugging just came on and Android's debugging service starts listening a moment later. */
+     *  debugging just came on and Android's debugging service starts listening a moment later. [ready] is said once
+     *  the card has been read; with [via], only if it was reached that way, as a chosen way that fails falls back. */
     private fun startConnection(retry: Boolean = false, ready: String? = null, askingAllow: Boolean = false,
-                                portMayOpen: Boolean = false, block: () -> Unit) {
+                                portMayOpen: Boolean = false, via: AccessMethod? = null, block: () -> Unit) {
         allowCancelled = false
         _ui.update { it.copy(access = AccessStatus.CONNECTING, askingAllow = askingAllow, error = null, errorTitle = null,
             info = null) }
@@ -458,12 +714,13 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
                 failedWith = null
                 if (PairingFlow.state.value.active) PairingFlow.stop(getApplication()) // connected another way
                 _ui.update { it.copy(access = AccessStatus.READY, paired = backend.wasPaired, pairingExpired = false,
-                    allowAgain = false, portClosed = false, nearbyNeeded = false, askingAllow = false,
+                    allowAgain = false, portClosed = false, nearbyNeeded = false, askingAllow = false, lookingForCards = true,
                     // Connected over ADB: the phone allows this app again.
                     simAllowNeeded = it.simAllowNeeded && backend.method != AccessMethod.ADB,
                     background = backend.inBackground, helperUnavailable = backend.helperUnavailable,
-                    method = backend.method, canSetUpSim = backend.canSetUpSim, rootFound = backend.rootFound, rootDeclined = backend.rootDeclined) }
-                loadCard(ready)
+                    method = backend.method, canSetUpSim = backend.canSetUpSim, rootFound = backend.rootFound, rootDeclined = backend.rootDeclined,
+                    preferred = backend.preferred, preferredFailure = backend.preferredFailure) }
+                loadCard(ready?.takeIf { via == null || backend.method == via })
             } catch (e: CancellationException) { throw e }
             catch (e: PairingRequiredException) {
                 _ui.update { it.copy(access = AccessStatus.SETUP, askingAllow = false, paired = false, pairingExpired = true,
@@ -498,7 +755,8 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
                 failedWith = s
                 _ui.update { it.copy(access = AccessStatus.SETUP, paired = backend.wasPaired, settings = s,
                     method = backend.method, rootFound = backend.rootFound, rootDeclined = backend.rootDeclined, eid = null, profiles = emptyList(),
-                    portClosed = false, allowAgain = false, noSim = noSimInPhone(getApplication()), error = e.message) }
+                    portClosed = false, allowAgain = false, noSim = noSimInPhone(getApplication()),
+                    error = chosenNote() ?: e.message) }
             } catch (e: Exception) {
                 // Switched off meanwhile (e.g. "Allow on this network?" declined): its own screen explains.
                 val s = DebugSettings.read(getApplication())
@@ -512,7 +770,7 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
                     method = backend.method, rootFound = backend.rootFound, rootDeclined = backend.rootDeclined,
                     portClosed = it.portClosed && otherWay, allowAgain = it.allowAgain && otherWay,
                     error = when {
-                        e is ShizukuApduBackend.Failure && allowCancelled -> null
+                        e is ConnectCancelledException || (e is ShizukuApduBackend.Failure && allowCancelled) -> null
                         s.mayConnect || direct || otherWay -> e.message ?: "Couldn't connect. Try again."
                         else -> null
                     }) }
@@ -526,6 +784,7 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
         if (working) return
         _ui.update { it.copy(access = AccessStatus.SETUP, stopped = true, background = false, eid = null,
             profiles = emptyList(), details = null, error = null) }
+        looking?.cancel() // it holds the card thread between slots, so stop() would wait for the rest
         viewModelScope.launch { withContext(cardDispatcher) { backend.stop() } }
     }
 
@@ -534,32 +793,196 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
     /** [done]: said once the card has been read, so "Card access is back" can't come before a failed read. */
     fun loadCard(done: String? = null) {
         if (working || _ui.value.access != AccessStatus.READY) return
-        _ui.update { it.copy(loading = true, error = null, errorTitle = null, builtInChip = null) }
+        // Each way in numbers slots its own way, so a list on screen from another is no card this app can reach now.
+        if (cardsVia != backend.method) {
+            forgetCards()
+            cardsVia = backend.method
+            simOf = emptyMap()
+            hungSlots = emptySet() // slots of another way in
+            _ui.update { it.copy(eid = null, slot = -1, profiles = emptyList(), details = null, waiting = null, cardInfo = null) }
+        }
+        val stay = refreshStays(lpa.card?.eid, store.chosenCard(), _ui.value.manageable)
+        _ui.update { it.copy(loading = true, error = null, errorTitle = null, builtInChip = null, idleSlot = -1) }
+        val card = if (stay) lpa else lpa.again()
         viewModelScope.launch {
             try {
-                val (eid, slot, profiles) = withContext(cardDispatcher) {
+                val (shown, profiles) = withContext(cardDispatcher) {
                     backend.reading {
-                        lpa.slotHint = store.lastSlot(backend.method)
-                        val eid = lpa.discover()
-                        val held = lpa.onBuiltInSlot && eid !in store.ownCards()
+                        if (stay) try {
+                            noticesVia = backend.method
+                            return@reading card to card.read().activeFirst()
+                        } catch (e: ApduException) {
+                            // Taken out, as Android says: whatever card is in the phone now is found as for anyone else.
+                            // So for one there that refuses this app: it's not the one chosen, which let it in.
+                            if (!Lpa.isLockedOnly(e.message) &&
+                                runCatching { backend.present(card.slot) }.getOrNull() != false) throw e
+                        }
+                        val finder = if (stay) card.again(sameSlot = false) else card
+                        val chosen = store.chosenCard()?.let { store.cardSlot(backend.method, it) } ?: -1
+                        finder.slotHint = if (chosen >= 0) chosen else store.lastSlot(backend.method)
+                        val eid = finder.discover()
+                        val held = finder.onBuiltInSlot && eid !in store.ownCards()
                         noticesVia = backend.method.takeUnless { held }
-                        if (!held && lpa.slot != lpa.slotHint) store.setLastSlot(backend.method, lpa.slot)
-                        Triple(eid, lpa.slot, if (held) null else lpa.getProfiles().activeFirst())
+                        if (!held && finder.slot != store.lastSlot(backend.method)) store.setLastSlot(backend.method, finder.slot)
+                        finder to if (held) null else finder.getProfiles().activeFirst()
                     }
                 }
                 // Android's to manage, and a delete there can't be undone: nothing on it is read or changed from here.
                 if (profiles == null) {
                     _ui.update { it.copy(loading = false, eid = null, slot = -1, profiles = emptyList(), details = null,
                         waiting = null, adding = false, keepDraft = it.keepDraft || it.adding, installed = null,
-                        duplicate = null, builtInChip = eid) }
+                        duplicate = null, builtInChip = shown.card?.eid, idleSlot = shown.idleSlot) }
                     return@launch
                 }
-                _ui.update { it.copy(loading = false, eid = eid, slot = slot, profiles = profiles, info = done ?: it.info) }
+                show(shown, profiles, done)
                 deliverNotices() // any left over from earlier, e.g. a delete made offline
             } catch (e: CancellationException) { throw e }
+            catch (e: ApduException) {
+                // The card someone chose was swapped for another: that one is to be offered, which a look does only for a
+                // slot that isn't in view.
+                if (stay && e.message == Lpa.OTHER_CARD) {
+                    lpa = lpa.again(sameSlot = false)
+                    _ui.update { it.copy(loading = false, eid = null, slot = -1, sim = -1, profiles = emptyList(), details = null,
+                        waiting = null, cards = it.cards.filterNot { row -> row.slot == card.slot },
+                        error = "Another card is in SIM ${it.simNumber} now. Choose a card at the top, or tap Try again.") }
+                } else if (_ui.value.eid != null && Lpa.isLockedOnly(e.message)) {
+                    // What's gone is the card in view. The one that refuses this app has its row at the top already, and
+                    // the dialog has no "Change card access".
+                    failed(e, "Couldn't refresh the card", Lpa.NOT_FOUND, changing = false)
+                } else failed(e, if (_ui.value.eid == null) null else "Couldn't refresh the card", changing = false)
+            }
             // With no card shown yet, the error is shown inline next to "Try again".
             catch (e: Exception) { failed(e, if (_ui.value.eid == null) null else "Couldn't refresh the card", changing = false) }
+            // Whatever became of that card: another one may be the way out.
+            finally { lookForCards() }
         }
+    }
+
+    /** [card], just read, is the one in view now. The card it replaces may just have stopped answering: it stays known. */
+    private fun show(card: Lpa, profiles: List<EuiccProfile>, done: String?) {
+        val eid = card.card?.eid ?: return
+        val ui = _ui.value
+        ui.eid?.takeIf { it != eid }?.let { kept = kept + (it to Kept(lpa, ui.profiles)) }
+        // One slot holds one card: one there before was taken out for this one.
+        kept = kept.filterValues { it.lpa.slot != card.slot } - eid
+        lpa = card
+        _ui.update { it.copy(loading = false, eid = eid, slot = card.slot, profiles = profiles, info = done ?: it.info,
+            // The number goes with the slot: a card put in another one has another.
+            sim = simOf[card.slot] ?: -1,
+            cardInfo = it.cardInfo.takeIf { _ -> it.eid == eid }) }
+    }
+
+    /** Puts [eid] in view: at once if its list is known, while it's read again. On a card already in view, the form's
+     *  choice just goes to it. */
+    fun selectCard(eid: String) {
+        landing = null // picked by hand, or the landing itself
+        val ui = _ui.value
+        if (eid == ui.eid) {
+            store.chooseCard(eid)
+            _ui.update { it.copy(addTarget = eid) }
+            return
+        }
+        val next = kept[eid]
+        if (working || ui.access != AccessStatus.READY || next == null) return
+        lookEpoch++ // what's in view is what a look leaves alone
+        ui.eid?.let { kept = kept + (it to Kept(lpa, ui.profiles)) }
+        lpa = next.lpa
+        store.chooseCard(eid)
+        _ui.update { it.copy(eid = eid.takeIf { _ -> next.profiles != null }, slot = next.lpa.slot, profiles = next.profiles.orEmpty(),
+            sim = simOf[next.lpa.slot] ?: -1, cards = it.rows, cardInfo = null, waiting = null,
+            details = null, addTarget = if (it.adding) eid else it.addTarget) }
+        loadCard()
+    }
+
+    /** Card access went, or changed: every address is void. [hungSlots] aren't, as Reconnect is what clears those. */
+    private fun forgetCards() {
+        lookEpoch++
+        kept = emptyMap()
+        seen = emptyMap()
+        lpa = lpa.again(sameSlot = false)
+        _ui.update { it.copy(cards = emptyList(), sim = -1, slot = if (it.eid == null) -1 else it.slot, lookingForCards = true) }
+    }
+
+    /** Looks for other cards, after the first list is on screen, so one card costs what it did. Only ever changes what
+     *  the switcher offers: the view stays, as someone may be in a dialog or a form on it. One at a time, and a look whose
+     *  answer no longer applies goes again. [quick]: only what needs no card traffic. */
+    private fun lookForCards(quick: Boolean = false) {
+        if (looking?.isActive == true || _ui.value.access != AccessStatus.READY) return
+        looking = viewModelScope.launch {
+            try {
+                do {
+                    val epoch = lookEpoch
+                    val inView = _ui.value.slot
+                    val known = seen
+                    val hung = hungSlots
+                    val own = store.ownCards()
+                    val how = backend.method
+                    val looks = withContext(cardDispatcher) {
+                        backend.reading { lpa.scan(inView, known, own, { s, t -> store.noManager(how, s, t) }, hung, quick) { isActive } }
+                    }
+                    val current = epoch == lookEpoch
+                    // The card in view turned up in another slot: the slot it left wasn't looked behind, and may hold
+                    // a card of its own now.
+                    val moved = current && lookedThrough(looks, how)
+                } while ((!current || moved) && _ui.value.access == AccessStatus.READY)
+                land()
+            } catch (e: CancellationException) { throw e }
+            // Not something people asked for: what's on screen stands.
+            catch (e: Exception) { Log.w("LpaViewModel", "Looking for cards failed", e) }
+            // Not after a cancel: that look didn't get through the slots, and the one after it is what Install waits for.
+            _ui.update { it.copy(lookingForCards = false) }
+        }
+    }
+
+    /** After a switch of card access, once a look has found the cards that way: the [landing] card comes into view. */
+    private fun land() {
+        val l = landing ?: return
+        if (cardsVia != backend.method) return
+        landing = null
+        val ui = _ui.value
+        val cards = ui.rows.filter { it.eid != null }
+        val target = when (l) {
+            is Landing.Keep -> cards.firstOrNull { it.eid == l.eid }
+            is Landing.Other -> cards.firstOrNull { it.eid != l.notEid && it.sim == l.sim }
+                ?: cards.firstOrNull { it.eid != l.notEid }
+        }
+        // Android 9 and older reach a card outside SIM 1 this way only while one of its eSIMs is on (see SlotReach).
+        if (target == null && l is Landing.Other && Build.VERSION.SDK_INT < 29 && backend.method != AccessMethod.DIRECT)
+            _ui.update { it.copy(info = "Couldn't reach the card in SIM ${l.sim + 1}. On this version of Android, the app " +
+                "reaches a card outside SIM 1 only while one of its eSIMs is on. Move it to SIM 1 to manage it.") }
+        target?.eid?.takeIf { it != ui.eid }?.let(::selectCard)
+    }
+
+    /** True when the card in view was found in another slot, and the view went with it. */
+    private fun lookedThrough(looks: List<SlotLook>, how: AccessMethod?): Boolean {
+        Log.i("LpaViewModel", "Looked for cards: " + looks.joinToString { "${it.slot}=${it.what}" })
+        for (l in looks) {
+            when (l.what) {
+                SlotLook.What.CARD -> l.card?.let { kept = kept + (it.eid to Kept(lpa.at(it), l.profiles?.activeFirst())) }
+                SlotLook.What.EMPTY, SlotLook.What.IDLE, SlotLook.What.LOCKED -> kept = kept.filterValues { it.lpa.slot != l.slot }
+                SlotLook.What.HUNG -> hungSlots = hungSlots + l.slot
+                else -> { }
+            }
+            if (l.noManager && l.token != null) store.setNoManager(how, l.slot, l.token)
+        }
+        seen = seenAfter(seen, looks)
+        simOf = simOf + looks.mapNotNull { l -> l.logical?.let { l.slot to it } }
+        val inView = _ui.value.eid
+        // Taken out and put in another slot: the next read has to go there. Not under an operation, which has the
+        // card: the next look finds it again.
+        val moved = looks.firstNotNullOfOrNull { l -> l.card?.takeIf { it.eid == inView && it.slot != _ui.value.slot } }
+        if (moved != null) {
+            if (!working) { lpa = lpa.at(moved); _ui.update { it.copy(slot = moved.slot, sim = simOf[moved.slot] ?: -1) } }
+            else seen = seen - moved.slot
+        }
+        inView?.let { kept = kept - it }
+        _ui.update {
+            val sim = looks.firstOrNull { l -> l.slot == it.slot }?.logical ?: it.sim
+            val rows = withView(rowsAfter(it.cards, looks), it.slot, it.eid, it.profiles, sim)
+            it.copy(cards = rows, sim = sim)
+        }
+        if (_ui.value.manageable >= 2) _ui.value.cards.forEach { row -> row.eid?.let { store.setCardSlot(how, it, row.slot) } }
+        return moved != null && !working
     }
 
     /** "It's my removable card": a phone can report one as built in. Remembered, so this is asked once per card. */
@@ -571,11 +994,17 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
     /** [note] is added to the "Now using" message. With [setup], the phone's SIM settings follow the switch,
      *  and the choice is remembered for next time. */
     fun enable(p: EuiccProfile, note: String? = null, setup: ProfileStore.SwitchSetup? = null) {
-        setup?.let { s -> store.setSwitchSetup(s); _ui.update { it.copy(switchSetup = s) } }
+        setup?.let { chosen ->
+            // With several cards the tick follows which card has mobile data now: a remembered one would be another card's.
+            val s = if (_ui.value.manageable >= 2) chosen.copy(mobileData = store.switchSetup().mobileData) else chosen
+            store.setSwitchSetup(s)
+            _ui.update { it.copy(switchSetup = s) }
+        }
         // No way to change SIM settings (direct card access, no pairing): the dialog had no checkboxes, so the
         // message offers the phone's own SIM settings instead.
         val manual = !_ui.value.canSetUpSim
-        _ui.update { it.copy(subBeforeSwitch = simSubscription(getApplication(), it.slot)) }
+        val defaults = defaultsNote(dataFollows = setup?.mobileData == true && !manual)
+        _ui.update { it.copy(subBeforeSwitch = simSubscription(getApplication(), it.androidSlot)) }
         op("Switching to ${p.displayName}…", "Now using ${p.displayName}" + (note?.let { ". $it" } ?: ""),
             "Couldn't switch eSIM", settle = true,
             run = { lpa.enable(p) }, confirmed = { l -> l.any { it.isdpAid == p.isdpAid && it.enabled } },
@@ -586,8 +1015,20 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
                 // A pairing Android dropped meanwhile: the next switch dialog leaves the checkboxes out. The sheet closes
                 // too: the result and its SIM settings link show in a snackbar, which a sheet would cover.
                 _ui.update { it.copy(paired = backend.wasPaired, canSetUpSim = backend.canSetUpSim, details = null) }
-                advice
+                listOfNotNull(advice, defaults).joinToString(" ").ifEmpty { null }
             })
+    }
+
+    /** With a second card's SIM on, Android moves or clears what the eSIM going off has: it can leave calls asking every
+     *  time, or mobile data off. Which it does varies by version and phone, so this only points to where to look. Read
+     *  before the switch, as Android changes them along the way. For [op]'s message, which adds a link to SIM settings. */
+    private fun defaultsNote(dataFollows: Boolean = false): String? {
+        val ui = _ui.value
+        if (ui.manageable < 2 || ui.rows.none { it.slot != ui.slot && it.on != null }) return null
+        // This app moves mobile data to the new eSIM itself when asked to.
+        val held = defaultsOn(simSubscription(getApplication(), ui.androidSlot)) - (if (dataFollows) setOf(MOBILE_DATA) else emptySet())
+        if (held.isEmpty()) return null
+        return "Check which SIM your phone uses for ${listed(held)} now: Android may have changed that with the switch."
     }
 
     /** Android brings a newly switched-on eSIM up a few seconds after the card restarts: wait for that, then
@@ -621,23 +1062,23 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
                     // Android 10 and older: set up with a computer, until the phone restarts.
                     Build.VERSION.SDK_INT < 30 -> when {
                         e.needsAllow -> {
-                            // Details › Mobile data and roaming offers to allow it again from now on.
+                            // Settings › Mobile data and roaming offers to allow it again from now on.
                             _ui.update { it.copy(simAllowNeeded = true) }
                             "Your phone no longer allows this app's debugging access, so $todo in your phone's SIM " +
-                                "settings. To allow it again, open Details › Mobile data and roaming."
+                                "settings. To allow it again, open \"Mobile data and roaming\" in this app's Settings."
                         }
-                        e.needsPairing -> "Set up mobile data and roaming in Details first, so $todo in your " +
-                            "phone's SIM settings this time."
+                        e.needsPairing -> "Set up mobile data and roaming in this app's Settings first, so $todo in " +
+                            "your phone's SIM settings this time."
                         DebugSettings.read(getApplication()).mayConnect -> "Couldn't reach Android's debugging tool " +
                             "(after a restart it needs your computer again), so $todo in your phone's SIM settings."
                         else -> "USB debugging is off, so $todo in your phone's SIM settings."
                     }
-                    e.needsPairing -> "Wireless debugging needs pairing again (in Details › Mobile data and roaming), " +
-                        "so $todo in your phone's SIM settings."
+                    e.needsPairing -> "Wireless debugging needs pairing again (in this app's Settings, under \"Mobile " +
+                        "data and roaming\"), so $todo in your phone's SIM settings."
                     // Android 17: Wireless debugging has a new port, and finding it needs a permission.
                     e.cause is NearbyDevicesNeededException -> "This app needs \"Nearby devices\" to find Wireless " +
-                        "debugging (allow it in the app's settings, under Permissions), so $todo in your phone's SIM " +
-                        "settings."
+                        "debugging (allow it under Permissions on this app's page in your phone's Settings), so $todo " +
+                        "in your phone's SIM settings."
                     DebugSettings.read(getApplication()).mayConnect ->
                         "Couldn't reach Wireless debugging, so $todo in your phone's SIM settings."
                     else -> "Wireless debugging is off, so $todo in your phone's SIM settings."
@@ -657,21 +1098,35 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
         return "Your phone hasn't picked up the eSIM yet. If it doesn't connect, $todo in your phone's SIM settings."
     }
 
-    fun disable(p: EuiccProfile) = op(
-        "Turning off ${p.displayName}…", "${p.displayName} is off", "Couldn't turn off eSIM", settle = true,
-        run = { lpa.disable(p) }, confirmed = { l -> l.none { it.isdpAid == p.isdpAid && it.enabled } },
-        onDone = { deliverNotices(afterSwitch = true) }, work = "Turning off eSIM…")
+    fun disable(p: EuiccProfile) {
+        val defaults = defaultsNote()
+        var answered = false // the card said it's done: what fails after that is the card coming back
+        op("Turning off ${p.displayName}…", "${p.displayName} is off", "Couldn't turn off eSIM", settle = true,
+            run = { answered = lpa.disable(p) }, confirmed = { l -> l.none { it.isdpAid == p.isdpAid && it.enabled } },
+            afterwards = { defaults }, onDone = { deliverNotices(afterSwitch = true) }, work = "Turning off eSIM…",
+            // Some phones stop seeing a card with no eSIM on, which looks like a failed turn-off but isn't one.
+            failure = { if (answered && _ui.value.profiles.none { it.enabled && it.isdpAid != p.isdpAid })
+                "Card not answering" to "${p.displayName} is off, but the card isn't answering now. Some phones stop " +
+                    "seeing a card with no eSIM on. Restart your phone. If the card still doesn't show up, put it in " +
+                    "another phone and turn an eSIM on there." else null })
+    }
 
-    /** The provider is told afterwards, in the background. */
-    fun delete(p: EuiccProfile) = op(
-        "Deleting ${p.displayName}…", "${p.displayName} deleted", "Couldn't delete eSIM", settle = false,
-        run = { lpa.delete(p); store.setNote(p.iccid, ""); store.setHidden(p.iccid, false) },
-        confirmed = { l -> l.none { it.isdpAid == p.isdpAid } }, onDone = ::deliverNotices)
+    /** The provider is told afterwards, in the background. A copy of the eSIM on another card keeps its note: a note goes
+     *  with the eSIM, and the ICCID is all that says which that is. */
+    fun delete(p: EuiccProfile) {
+        val copy = kept.values.any { c -> c.profiles?.any { it.iccid == p.iccid } == true }
+        op("Deleting ${p.displayName}…", "${p.displayName} deleted", "Couldn't delete eSIM", settle = false,
+            run = { lpa.delete(p); if (!copy) { store.setNote(p.iccid, ""); store.setHidden(p.iccid, false) } },
+            confirmed = { l -> l.none { it.isdpAid == p.isdpAid } }, onDone = ::deliverNotices)
+    }
 
     /** Saved on the card itself; a blank [name] brings back the provider's name. */
-    fun rename(p: EuiccProfile, name: String) = op(
-        "Saving name…", if (name.isBlank()) "Name reset to ${p.copy(nickname = null).displayName}" else "Renamed to ${name.trim()}",
-        "Couldn't rename eSIM", settle = false, run = { lpa.setNickname(p.iccid, name) })
+    fun rename(p: EuiccProfile, name: String) {
+        var answered = true // the card said it's done; without that, the list it gives next has to show the name
+        op("Saving name…", if (name.isBlank()) "Name reset to ${p.copy(nickname = null).displayName}" else "Renamed to ${name.trim()}",
+            "Couldn't rename eSIM", settle = false, run = { answered = lpa.setNickname(p.iccid, name) },
+            confirmed = { l -> answered || l.any { it.iccid == p.iccid && it.nickname.orEmpty() == name.trim() } })
+    }
 
     fun setNote(p: EuiccProfile, text: String) {
         store.setNote(p.iccid, text)
@@ -687,7 +1142,8 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
     /** [afterwards] runs once the card confirms the change; a sentence it returns is added to [done]. */
     private fun op(label: String, done: String, failTitle: String, settle: Boolean,
                    run: () -> Unit, confirmed: (List<EuiccProfile>) -> Boolean = { true },
-                   afterwards: () -> String? = { null }, onDone: () -> Unit = {}, work: String = "Switching eSIM…") {
+                   afterwards: () -> String? = { null }, onDone: () -> Unit = {}, work: String = "Switching eSIM…",
+                   failure: () -> Pair<String, String>? = { null }) {
         if (working || _ui.value.access != AccessStatus.READY) return
         _ui.update { it.copy(busy = Busy(label), error = null, errorTitle = null, info = null) }
         viewModelScope.launch {
@@ -706,7 +1162,10 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
                     details = it.details?.takeIf { id -> profiles.any { p -> p.iccid == id } }) }
                 onDone()
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { failed(e, failTitle) }
+            catch (e: Exception) {
+                val (title, message) = failure() ?: (failTitle to (e.message ?: "Card operation failed"))
+                failed(e, title, message)
+            }
             finally { if (settle) CardWork.end() } // cancelled too, only ever after the blocking block above has ended
         }
     }
@@ -715,7 +1174,7 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
 
     /** On the card thread, set by [loadCard]: the way in that found the card on screen, whose notices these are. Slot
      *  numbers mean something only to that way in. Null while it's the chip in [LpaUi.builtInChip]: those are Android's. */
-    private var noticesVia: AccessMethod? = null
+    @Volatile private var noticesVia: AccessMethod? = null
     private val noticesAllowed get() = noticesVia != null && noticesVia == backend.method
 
     /** Tell providers about installs, switches and deletes the card has noted, in the background and one run
@@ -724,20 +1183,24 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
      *  switch, so what didn't get through is tried a few more times. */
     private fun deliverNotices(afterSwitch: Boolean = false) {
         val previous = notices
+        // Retries stay with the card that switched, whatever comes into view meanwhile, and with the way in whose slot
+        // numbers its address is in.
+        val card = lpa
+        val via = backend.method
         notices = viewModelScope.launch {
             previous?.join()
-            whileLeft(if (afterSwitch) NOTICE_RETRIES else emptyList()) { sendNotices() }
+            whileLeft(if (afterSwitch) NOTICE_RETRIES else emptyList()) { sendNotices(card, via) }
         }
     }
 
     /** One run: true when something is left to send. Nothing here is news to people, so a failure stays quiet. */
-    private suspend fun sendNotices() = try {
+    private suspend fun sendNotices(card: Lpa, via: AccessMethod?) = try {
         val pending = withContext(cardDispatcher) {
-            if (noticesAllowed) backend.reading { lpa.takeNotifications() } else emptyList()
+            if (noticesAllowed && backend.method == via) backend.reading { card.takeNotifications() } else emptyList()
         }
-        val delivered = deliverEach(pending) { n -> withContext(Dispatchers.IO) { lpa.deliver(n) } }
+        val delivered = deliverEach(pending) { n -> withContext(Dispatchers.IO) { card.deliver(n) } }
         if (delivered.isNotEmpty()) withContext(cardDispatcher) {
-            if (noticesAllowed) lpa.removeNotifications(delivered.map { it.seq })
+            if (noticesAllowed && backend.method == via) card.removeNotifications(delivered.map { it.seq })
         }
         delivered.size < pending.size
     } catch (e: CancellationException) { throw e } catch (_: Exception) { true }
@@ -756,17 +1219,20 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
     fun loadCardInfo() {
         if (_ui.value.access != AccessStatus.READY) return
         _ui.update { it.copy(cardInfoLoading = true) }
+        val card = lpa // outside the gate on changing card: the sheet can be closed and another card picked meanwhile
         viewModelScope.launch {
             val r = try {
                 withContext(cardDispatcher) {
                     backend.reading {
                         // Asked apart: a card that won't say its addresses still shows its other details.
-                        val (defaultDp, rootDs) = runCatching { lpa.configuredAddresses() }.getOrDefault(null to null)
-                        lpa.cardInfo().copy(rootDs = rootDs, defaultDp = defaultDp)
+                        val (defaultDp, rootDs) = runCatching { card.configuredAddresses() }.getOrDefault(null to null)
+                        card.cardInfo().copy(rootDs = rootDs, defaultDp = defaultDp)
                     }
                 }
             } catch (e: CancellationException) { throw e } catch (_: Exception) { null }
-            _ui.update { it.copy(cardInfoLoading = false, cardInfo = r ?: it.cardInfo) }
+            // By EID, not object: a refresh meanwhile gives the same card a new one.
+            val same = card.card?.eid?.let { it == lpa.card?.eid } == true
+            _ui.update { it.copy(cardInfoLoading = false, cardInfo = r.takeIf { _ -> same } ?: it.cardInfo) }
         }
     }
 
@@ -776,6 +1242,8 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
     // ---------------- install ----------------
 
     fun openAdd() = _ui.update { it.addOpened() }
+    /** For a code from another app, which has no card of its own: with several, people pick. */
+    fun openAddFromOutside() = _ui.update { it.addOpened(target = null) }
     fun closeAdd() = _ui.update { it.copy(adding = false, duplicate = null, waiting = null) }
 
     /** Shared text or an opened link: the activation code in it waits for the Add eSIM form, which opens as
@@ -881,8 +1349,8 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
 
     /** [force]: the user saw the duplicate warning and wants to try anyway. */
     fun download(ac: ActivationCode, confirmationCode: String?, force: Boolean = false) {
-        // eid: the card has been read, so the eSIMs already on it are known (the new one is told apart from them).
-        if (working || _ui.value.access != AccessStatus.READY || _ui.value.eid == null) return
+        // The card has been read, so the eSIMs already on it are known (the new one is told apart from them).
+        if (working || _ui.value.access != AccessStatus.READY || !_ui.value.mayInstall) return
         val prior = if (force) null else store.installOf(ac)
         if (prior != null) {
             val onCard = prior.iccid?.let { id -> _ui.value.profiles.firstOrNull { it.iccid == id } }
@@ -909,7 +1377,12 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
                     (added?.iccid ?: outcome.iccid)?.let { store.setHidden(it, false) }
                     Triple(outcome, profiles, added)
                 }
-                _ui.update { it.copy(busy = null, adding = false, waiting = null, profiles = profiles ?: it.profiles,
+                // The card's answer didn't say how it went, and no new eSIM shows: not something to call installed.
+                // The code stays recorded all the same, as the provider has handed the eSIM out by now.
+                if (!outcome.confirmed && added == null) _ui.update { it.copy(busy = null, keepDraft = true,
+                    profiles = profiles ?: it.profiles, hidden = store.hidden(),
+                    errorTitle = "Install not confirmed", error = Lpa.INSTALL_UNKNOWN) }
+                else _ui.update { it.copy(busy = null, adding = false, waiting = null, profiles = profiles ?: it.profiles,
                     installed = added, hidden = store.hidden(),
                     info = when {
                         added != null -> null
@@ -949,9 +1422,13 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
 
     fun dismissDuplicate() = _ui.update { it.copy(duplicate = null) }
 
-    /** An earlier install of [ac] by this app, with the eSIM it became if that is still on the card. */
-    fun priorInstall(ac: ActivationCode): Pair<ProfileStore.Install, EuiccProfile?>? = store.installOf(ac)?.let { prior ->
-        prior to prior.iccid?.let { id -> _ui.value.profiles.firstOrNull { it.iccid == id } }
+    /** An earlier install of [ac] by this app, with the eSIM it became if that is still on the card in view, or the row of
+     *  another card that has it. That's only worth a word: it's how an eSIM moves from one card to the other. */
+    fun priorInstall(ac: ActivationCode): PriorInstall? = store.installOf(ac)?.let { prior ->
+        val id = prior.iccid
+        val other = kept.entries.firstOrNull { (_, c) -> c.profiles?.any { it.iccid == id } == true }?.key
+        PriorInstall(prior, id?.let { _ui.value.profiles.firstOrNull { p -> p.iccid == it } },
+            other?.takeIf { id != null }?.let { eid -> _ui.value.cards.firstOrNull { it.eid == eid } })
     }
 
     /** "Show it" on the duplicate warning: close the install dialog and open the existing eSIM. */
@@ -1042,6 +1519,7 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
     private companion object {
         const val INCOMING = "incoming"
         const val ADDING = "adding"
+        const val ADD_TARGET = "add-target"
         // Serialize entire LPA operations, not just individual APDUs. One thread for the process, not per ViewModel: an
         // install left running by people swiping the app away finishes first, and a reopened app queues behind it.
         val worker = Executors.newSingleThreadExecutor()
@@ -1130,8 +1608,8 @@ internal fun networkMessage(e: Exception, server: String = "the eSIM provider's 
         chain.any { it is SocketTimeoutException } ->
             "No answer from $server. On public Wi-Fi, open a web page first to sign in. Then try again."
         chain.any { it is SSLException } -> "Couldn't make a secure connection to $server. Check that your phone's date " +
-            "and time are right (search Settings for \"Date & time\"). On public Wi-Fi, open a web page first to sign " +
-            "in. Then try again."
+            "and time are right (search your phone's Settings for \"Date & time\"). On public Wi-Fi, open a web page " +
+            "first to sign in. Then try again."
         // After the others, which are IOExceptions too. Card links never get here: they end up as ApduExceptions.
         chain.any { it is IOException } -> "The connection to $server dropped. Check your internet connection and try again."
         else -> otherwise
@@ -1139,3 +1617,11 @@ internal fun networkMessage(e: Exception, server: String = "the eSIM provider's 
 }
 
 private fun List<EuiccProfile>.activeFirst() = sortedByDescending { it.enabled }
+
+/** The card to show once card access switched to another way: the one in view before ([Keep]), or for a card direct
+ *  access couldn't open, another than that one ([Other]), the one in Android's SIM [Other.sim] (from 0) if it's found.
+ *  By EID: each way in numbers slots its own way, so an old slot would be another card. */
+private sealed interface Landing {
+    data class Keep(val eid: String) : Landing
+    data class Other(val notEid: String?, val sim: Int) : Landing
+}

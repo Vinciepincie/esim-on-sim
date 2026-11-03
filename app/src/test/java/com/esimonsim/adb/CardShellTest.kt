@@ -26,6 +26,7 @@ import java.util.concurrent.atomic.AtomicInteger
 class CardShellTest {
     private val isdR = "A0000005591010FFFFFFFF89000001"
     private val iccid = "8944478600000000037"
+    private val eid = "89049032000000000000000000012345"
 
     /** One call into a stand-in: the picked overload's name and parameter types, and the arguments. */
     data class Call(val method: String, val args: List<Any?>)
@@ -35,6 +36,7 @@ class CardShellTest {
         val calls = ArrayList<Call>()
         var reply: String? = "9000"
         var slots: Array<Any?>? = null
+        var cards: List<Any?>? = null
         /** What every call throws while set. */
         var failure: Exception? = null
         private var next = 1
@@ -47,6 +49,7 @@ class CardShellTest {
                 method.name.startsWith("iccTransmitApdu") -> reply
                 method.name.startsWith("iccCloseLogicalChannel") -> true
                 method.name == "getUiccSlotsInfo" -> slots ?: throw SecurityException("READ_PRIVILEGED_PHONE_STATE")
+                method.name == "getUiccCardsInfo" -> cards
                 else -> null
             }
         }
@@ -645,7 +648,43 @@ class CardShellTest {
         assertEquals(listed, shell(Phone29::class.java).slots())
         phone.reset()
         assertEquals(listed, android13().slots())
-        assertEquals(listOf("com.android.shell"), phone.calls.single().args)
+        assertEquals(listOf("getUiccSlotsInfo(String)" to listOf("com.android.shell"),
+            "getUiccCardsInfo(String)" to listOf("com.android.shell")), phone.calls.map { it.method to it.args })
+    }
+
+    @Test fun slotsSayWhatAndroidKnowsWithoutTouchingACard() {
+        // Android 12: the slot's own getters. A card Android has the EID of, and an ordinary SIM in use.
+        phone.slots = arrayOf(Slot12(false, true, 2, true, 0, iccid), Slot12(true, false, 2, true, 1, ""),
+            Slot12(true, true, 1, false, -1, ""))
+        phone.cards = listOf(CardInfo(1, eid))
+        val listed = shell(Phone31::class.java).slots()
+        assertEquals(mapOf("euicc" to false, "removable" to true, "present" to true, "active" to true, "logical" to 0),
+            listed[0] - "token")
+        assertEquals(mapOf("euicc" to true, "removable" to false, "present" to true, "active" to true, "logical" to 1, "eid" to eid),
+            listed[1])
+        assertEquals(mapOf("euicc" to true, "removable" to true, "present" to false, "active" to false), listed[2])
+        // Something to notice a change by, but never the ICCID itself.
+        val token = listed[0].getValue("token") as String
+        assertEquals(16, token.length)
+        assertFalse(iccid in token)
+    }
+
+    @Test fun androidThirteenSaysThroughPorts() {
+        // Its slot getters for these throw; one getter failing leaves the rest of the list.
+        phone.slots = arrayOf(Slot13(true, true, 2, listOf(Port(false, -1), Port(true, 0)), eid),
+            Slot13(true, false, 2, listOf(Port(false, -1)), "8944478600000000037F"), BrokenSlot())
+        val listed = android13().slots()
+        assertEquals(mapOf("euicc" to true, "removable" to true, "present" to true, "active" to true, "logical" to 0, "eid" to eid),
+            listed[0] - "token")
+        // A card Android has no EID for gives its ICCID as the card ID: that's no EID.
+        assertEquals(mapOf("euicc" to true, "removable" to false, "present" to true, "active" to false), listed[1] - "token")
+        assertEquals(mapOf("euicc" to true), listed[2])
+    }
+
+    @Test fun withoutCardInfoTheSlotsStillList() {
+        phone.slots = arrayOf(Slot12(true, true, 2, true, 0, ""))
+        phone.cards = listOf("not a card", null)
+        assertEquals(true, shell(Phone31::class.java).slots().single()["active"])
     }
 
     // Stand-ins for the hidden telephony interfaces, with the methods each Android version has (ITelephony.aidl
@@ -664,6 +703,49 @@ class CardShellTest {
     class Slot10(private val euicc: Boolean, private val removable: Boolean) {
         fun getIsEuicc() = euicc
         fun isRemovable() = removable
+    }
+
+    /** UiccSlotInfo on Android 10-12L, with what describes the slot. */
+    class Slot12(private val euicc: Boolean, private val removable: Boolean, private val state: Int, private val active: Boolean,
+                 private val logical: Int, private val cardId: String) {
+        fun getIsEuicc() = euicc
+        fun isRemovable() = removable
+        fun getCardStateInfo() = state
+        fun getIsActive() = active
+        fun getLogicalSlotIdx() = logical
+        fun getCardId() = cardId
+    }
+
+    /** UiccSlotInfo on Android 13+: by port, and the slot's own getters throw. */
+    class Slot13(private val euicc: Boolean, private val removable: Boolean, private val state: Int,
+                 private val ports: List<Port>, private val cardId: String) {
+        fun getIsEuicc() = euicc
+        fun isRemovable() = removable
+        fun getCardStateInfo() = state
+        fun getPorts() = ports
+        fun getCardId() = cardId
+        fun getIsActive(): Boolean = throw UnsupportedOperationException("getIsActive() is not supported by UiccSlotInfo")
+        fun getLogicalSlotIdx(): Int = throw UnsupportedOperationException("getLogicalSlotIdx() is not supported")
+    }
+
+    /** UiccPortInfo. */
+    class Port(private val active: Boolean, private val logical: Int) {
+        fun isActive() = active
+        fun getLogicalSlotIndex() = logical
+    }
+
+    /** A slot whose getters beyond the first all fail, as on some phone. */
+    class BrokenSlot {
+        fun getIsEuicc() = true
+        fun getCardStateInfo(): Int = throw IllegalStateException("no")
+        fun getPorts(): List<Port> = throw IllegalStateException("no")
+        fun getCardId(): String = throw IllegalStateException("no")
+    }
+
+    /** UiccCardInfo. */
+    class CardInfo(private val slot: Int, private val eid: String?) {
+        fun getSlotIndex() = slot
+        fun getEid() = eid
     }
 
     /** IccLogicalChannelRequest, Android 13+. */
@@ -730,6 +812,7 @@ class CardShellTest {
         fun setUserDataEnabled(subId: Int, enable: Boolean)
         fun setDataRoamingEnabled(subId: Int, isEnabled: Boolean)
         fun getUiccSlotsInfo(): Array<Any?>?
+        fun getUiccCardsInfo(callingPackage: String?): List<Any?>?
     }
 
     /** Android 12-12L (API 31-32). */
@@ -740,6 +823,7 @@ class CardShellTest {
         fun setDataEnabledForReason(subId: Int, reason: Int, enable: Boolean)
         fun setDataRoamingEnabled(subId: Int, isEnabled: Boolean)
         fun getUiccSlotsInfo(): Array<Any?>?
+        fun getUiccCardsInfo(callingPackage: String?): List<Any?>?
     }
 
     /** Android 13-17 (API 33-37): a request object, and ports. */
@@ -751,6 +835,7 @@ class CardShellTest {
         fun setDataEnabledForReason(subId: Int, reason: Int, enable: Boolean, callingPackage: String?)
         fun setDataRoamingEnabled(subId: Int, isEnabled: Boolean)
         fun getUiccSlotsInfo(callingPackage: String?): Array<Any?>?
+        fun getUiccCardsInfo(callingPackage: String?): List<Any?>?
     }
 
     /** Android 13+ that also kept Android 6's one-parameter calls: as many parameters as the request ones. */

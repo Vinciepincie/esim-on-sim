@@ -56,9 +56,7 @@ abstract class PipeApduBackend internal constructor(private val uids: Set<Int>) 
     fun useSim(slot: Int, iccid: String, data: Boolean, roaming: Boolean): SimSettingsResult =
         SimSettingsResult.of(rpc(SimSettingsResult.request(slot, iccid, data, roaming)))
 
-    override fun slots(): List<SlotInfo> = rpc(JSONObject().put("op", "slots")).getJSONArray("slots").let { all ->
-        List(all.length()) { i -> all.getJSONObject(i).let { SlotInfo(it.optBoolean("euicc"), it.optBoolean("removable", true)) } }
-    }
+    override fun slots(): List<SlotInfo> = SlotInfo.list(rpc(JSONObject().put("op", "slots")).getJSONArray("slots"))
 
     private fun request(op: String, slot: Int, port: Int, channel: Int = 0) = JSONObject()
         .put("op", op).put("slot", slot).put("port", port).put("channel", channel)

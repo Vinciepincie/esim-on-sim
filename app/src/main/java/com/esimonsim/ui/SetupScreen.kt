@@ -72,23 +72,43 @@ fun SetupScreen(ui: LpaUi, vm: LpaViewModel, modifier: Modifier = Modifier) {
     // Kept above the Connecting screen, so a failed attempt comes back with the port still filled in.
     val port = rememberSaveable { mutableStateOf("") }
     val pairAgain = pairAgainAt == ui.pairing.pairedCount
+    // The way these screens are about: the one chosen in this app's Settings, where it's ADB (whose setup this is) or
+    // worked before; else the one that worked last time. A choice that never worked has no Reconnect screen of its own:
+    // the setup steps say why it didn't (see LpaViewModel.chosenNote).
+    val way = ui.preferred?.takeIf { it == AccessMethod.ADB || it == ui.method } ?: ui.method
     // Card access worked without setup here before (the card let the app in, root, Shizuku): reconnecting is all it
     // takes, unless someone chooses to set up Wireless debugging instead.
     var setUpAnyway by rememberSaveable { mutableStateOf(false) }
-    val noSetup = (ui.method == AccessMethod.DIRECT || ui.method == AccessMethod.ROOT ||
-        ui.method == AccessMethod.SHIZUKU) && !setUpAnyway
+    // The way chosen in this app's Settings that "instead" replaced, for Back to put back.
+    var chosenBefore by rememberSaveable { mutableStateOf<AccessMethod?>(null) }
+    // Another way chosen in Settings meanwhile has a screen of its own.
+    LaunchedEffect(ui.preferred) {
+        if (ui.preferred != null && ui.preferred != AccessMethod.ADB) { setUpAnyway = false; chosenBefore = null }
+    }
+    val noSetup = (way == AccessMethod.DIRECT || way == AccessMethod.ROOT || way == AccessMethod.SHIZUKU) && !setUpAnyway
     // Android 10 and older: "Full setup" from the reconnect screen; and the computer step, which nothing on the
     // phone can check, done. Both kept above the Connecting screen, which the last step leads to.
     var computerAgain by rememberSaveable { mutableStateOf(false) }
     val computerDone = rememberSaveable { mutableStateOf(false) }
-    BackHandler(enabled = setUpAnyway && !pairAgain && !computerAgain) { vm.cancelPairing(); setUpAnyway = false }
+    BackHandler(enabled = setUpAnyway && !pairAgain && !computerAgain) {
+        vm.cancelPairing()
+        setUpAnyway = false
+        chosenBefore?.let(vm::preferIfChosen)
+        chosenBefore = null
+    }
     when {
         // The root app's or Shizuku's question comes up over this screen the first time; a root app may hide su until then.
+        // Root is only asked first in the automatic order, or when chosen.
         ui.access == AccessStatus.CONNECTING -> Connecting(modifier,
-            askRoot = ui.rootFound && ui.method != AccessMethod.ROOT && !ui.shizukuAsking, askShizuku = ui.shizukuAsking,
-            allowKey = if (ui.askingAllow) ui.adbKey.orEmpty() else null, onCancel = vm::cancelConnect)
-        // The error here talks of a "Reconnect" button, which the setup steps don't have.
-        noSetup -> DirectReconnect(ui, vm, modifier) { setUpAnyway = true; vm.dismissError() }
+            askRoot = ui.rootFound && ui.method != AccessMethod.ROOT &&
+                (ui.preferred == null || ui.preferred == AccessMethod.ROOT) && !ui.shizukuAsking,
+            askShizuku = ui.shizukuAsking, allowKey = if (ui.askingAllow) ui.adbKey.orEmpty() else null,
+            onCancel = vm::cancelConnect)
+        // The error here talks of a "Reconnect" button, which the setup steps don't have. "Instead" replaces a way
+        // chosen in this app's Settings, until Back.
+        noSetup -> DirectReconnect(ui, vm, modifier, way) {
+            chosenBefore = ui.preferred; setUpAnyway = true; vm.dismissError(); vm.preferIfChosen(AccessMethod.ADB)
+        }
         Build.VERSION.SDK_INT < 30 ->
             if (ui.paired && !computerAgain) ComputerReconnect(ui, vm, modifier, port) { computerAgain = true; computerDone.value = false }
             else ComputerSetup(ui, vm, modifier, computerDone, port, again = ui.paired,
@@ -147,9 +167,11 @@ private fun Connecting(modifier: Modifier, askRoot: Boolean, askShizuku: Boolean
     }
 }
 
-/** Card access worked without setup here before (the card let the app in, root, Shizuku), and isn't running now. */
+/** Card access worked without setup here before (the card let the app in, root, Shizuku), and isn't running now. [way]:
+ *  which of those, as [SetupScreen] picks it. */
 @Composable
-private fun DirectReconnect(ui: LpaUi, vm: LpaViewModel, modifier: Modifier, onSetUp: () -> Unit) = Centered(modifier) {
+private fun DirectReconnect(ui: LpaUi, vm: LpaViewModel, modifier: Modifier, way: AccessMethod?,
+                            onSetUp: () -> Unit) = Centered(modifier) {
     Icon(painterResource(R.drawable.ic_sim), contentDescription = null, Modifier.size(48.dp),
         tint = MaterialTheme.colorScheme.onSurfaceVariant)
     Spacer(Modifier.height(16.dp))
@@ -157,26 +179,30 @@ private fun DirectReconnect(ui: LpaUi, vm: LpaViewModel, modifier: Modifier, onS
         textAlign = TextAlign.Center, modifier = Modifier.semantics { heading() })
     Spacer(Modifier.height(8.dp))
     val error = ui.error?.takeIf { !ui.stopped }
+    val chosen = if (ui.preferred == way) ", as chosen in this app's Settings." else "."
     Text(when {
             ui.stopped -> "Reconnect any time."
-            ui.method == AccessMethod.ROOT && ui.rootDeclined -> "This app reaches your card with root. Allow " +
+            way == AccessMethod.ROOT && ui.rootDeclined -> "This app reaches your card with root$chosen Allow " +
                 "$APP_NAME in your root app, then tap \"Reconnect\"."
-            ui.method == AccessMethod.ROOT -> "This app reaches your card with root." +
+            way == AccessMethod.ROOT -> "This app reaches your card with root$chosen" +
                 if (error == null) " Check that the card is inserted, then tap \"Reconnect\"." else ""
-            ui.method == AccessMethod.SHIZUKU -> "This app reaches your card through Shizuku." +
+            way == AccessMethod.SHIZUKU -> "This app reaches your card through Shizuku$chosen" +
                 if (error == null) " Check that Shizuku is running, then tap \"Reconnect\"." else ""
-            else -> "This app normally reaches your card directly." +
+            else -> (if (ui.preferred == way) "This app reaches your card directly$chosen"
+                else "This app normally reaches your card directly.") +
                 if (error == null) " Check that it's inserted, then tap \"Reconnect\"." else ""
         }, style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center,
         color = MaterialTheme.colorScheme.onSurfaceVariant)
     error?.let { Spacer(Modifier.height(16.dp)); ErrorNote(it) }
     Spacer(Modifier.height(24.dp))
     // Stopped by a restart, usually: this app reconnects by itself once it's started.
-    if (ui.method == AccessMethod.SHIZUKU && ui.shizuku == ShizukuStatus.STOPPED) {
+    if (way == AccessMethod.SHIZUKU && ui.shizuku == ShizukuStatus.STOPPED) {
         val context = LocalContext.current
         Button(onClick = { openShizuku(context) }, Modifier.fillMaxWidth()) { Text("Open Shizuku") }
-        OutlinedButton(onClick = { vm.connect() }, Modifier.fillMaxWidth().padding(top = 8.dp)) { Text("Reconnect") }
-    } else Button(onClick = { vm.connect() }, Modifier.fillMaxWidth()) { Text("Reconnect") }
+        OutlinedButton(onClick = { vm.connect(forAdb = false) }, Modifier.fillMaxWidth().padding(top = 8.dp)) {
+            Text("Reconnect")
+        }
+    } else Button(onClick = { vm.connect(forAdb = false) }, Modifier.fillMaxWidth()) { Text("Reconnect") }
     // A locked card instead, say, or root taken away. Android 10 and older have no Wireless debugging.
     TextButton(onClick = onSetUp) {
         Text(if (Build.VERSION.SDK_INT >= 30) "Set up Wireless debugging instead" else "Set up with a computer instead")
@@ -250,7 +276,8 @@ private fun Reconnect(ui: LpaUi, vm: LpaViewModel, modifier: Modifier, port: Mut
         val noWifi = !s.wifi && s.wirelessDebugging != true
         // Android 17 may not say whether Developer options is on; Wireless debugging (off) is known either way.
         val devUnknown = s.developerOptions == null
-        val notInSettings = if (devUnknown) "\n\nNot in Settings? Then Developer options is off too: ${developerOptionsHint()}" else ""
+        val notInSettings = if (devUnknown) "\n\nNot in your phone's Settings? Then Developer options is off too: " +
+            developerOptionsHint() else ""
         val (title, body) = when {
             s.developerOptions == false -> "Turn Developer options back on" to
                 "Card access needs \"Developer options\".\n\n${developerOptionsHint()} " +
@@ -336,36 +363,49 @@ private enum class StepState { DONE, CURRENT, PENDING, UNKNOWN }
 
 private enum class PairMode { IDLE, NOTIFY, MANUAL }
 
-/** With direct card access: an optional pairing, only so the app can set mobile data and roaming after a switch.
- *  Done once a pairing succeeds; on Android 10 and older, once the phone allowed this app, also when it did before
- *  and forgot. Or once Shizuku allows this app, or root reaches the card instead. */
+/** What a setup screen sets up: card access ([CARD]); with direct access, ADB just so the app can set mobile data and
+ *  roaming ([SIM_SETTINGS]); or ADB as the way in from now on, chosen in this app's Settings while another way carries
+ *  on ([SWITCH]). */
+enum class SetupFor { CARD, SIM_SETTINGS, SWITCH }
+
+/** [SetupFor.SIM_SETTINGS], with direct card access: an optional pairing, only so the app can set mobile data and
+ *  roaming after a switch. Done once a pairing succeeds; on Android 10 and older, once the phone allowed this app, also
+ *  when it did before and forgot. Or once Shizuku allows this app, or root reaches the card instead.
+ *  [SetupFor.SWITCH]: Wireless debugging, or on Android 10 and older the computer's steps, to switch card access to.
+ *  The view model switches once it's paired (or at "Connect"), and closes this when that worked; nothing else does,
+ *  as Shizuku or root may well be usable already. */
 @Composable
-fun SimSettingsSetup(ui: LpaUi, vm: LpaViewModel, modifier: Modifier, onDone: () -> Unit) {
+fun SimSettingsSetup(ui: LpaUi, vm: LpaViewModel, modifier: Modifier, purpose: SetupFor, onDone: () -> Unit) {
+    val switch = purpose == SetupFor.SWITCH
     if (Build.VERSION.SDK_INT < 30) {
         // Already allowed before when allowing again, so this counts successes instead. Not saved: the count starts
         // from 0 again with the app, and so must this.
         val setUpBefore = remember { ui.simSettingsSetUps }
-        LaunchedEffect(ui.simSettingsSetUps, ui.method, ui.shizuku) {
+        if (!switch) LaunchedEffect(ui.simSettingsSetUps, ui.method, ui.shizuku) {
             if (ui.simSettingsSetUps > setUpBefore || ui.method == AccessMethod.ROOT ||
                 ui.shizuku == ShizukuStatus.ALLOWED) onDone()
         }
         // Only allowing this app again: what the computer turned on still answered.
-        val computerDone = rememberSaveable { mutableStateOf(ui.simAllowNeeded) }
-        ComputerSetup(ui, vm, modifier, computerDone, port = null, again = false, onBack = onDone, forSimSettings = true)
+        val computerDone = rememberSaveable { mutableStateOf(ui.simAllowNeeded && !switch) }
+        // Switching connects card access itself, so "adb tcpip" on another port works there too.
+        val port = rememberSaveable { mutableStateOf("") }
+        ComputerSetup(ui, vm, modifier, computerDone, port = port.takeIf { switch }, again = false, onBack = onDone,
+            purpose = purpose)
     } else {
         val pairedBefore = rememberSaveable { ui.pairing.pairedCount }
-        LaunchedEffect(ui.pairing.pairedCount, ui.method, ui.shizuku) {
+        if (!switch) LaunchedEffect(ui.pairing.pairedCount, ui.method, ui.shizuku) {
             if (ui.pairing.pairedCount > pairedBefore || ui.method == AccessMethod.ROOT ||
                 ui.shizuku == ShizukuStatus.ALLOWED) { vm.cancelPairing(); onDone() }
         }
-        Checklist(ui, vm, modifier, pairingAgain = false, onBack = { vm.cancelPairing(); onDone() }, forSimSettings = true)
+        Checklist(ui, vm, modifier, pairingAgain = switch && ui.pairingExpired, onBack = { vm.cancelPairing(); onDone() },
+            purpose = purpose)
     }
 }
 
 @RequiresApi(30)
 @Composable
 private fun Checklist(ui: LpaUi, vm: LpaViewModel, modifier: Modifier, pairingAgain: Boolean, onBack: (() -> Unit)?,
-                      forSimSettings: Boolean = false) {
+                      purpose: SetupFor = SetupFor.CARD) {
     val context = LocalContext.current
     BackHandler(enabled = onBack != null) { onBack?.invoke() }
     val s = ui.settings
@@ -381,24 +421,34 @@ private fun Checklist(ui: LpaUi, vm: LpaViewModel, modifier: Modifier, pairingAg
         i == current -> StepState.CURRENT
         else -> StepState.PENDING
     }
+    // Switching: paired here, but the switch that follows failed (its error came up over this). Connecting again is
+    // all it takes, unless people pair again.
+    var pairAgainAt by rememberSaveable { mutableStateOf<Int?>(null) }
+    val connectOnly = purpose == SetupFor.SWITCH && ui.paired && !ui.pairingExpired &&
+        pairAgainAt != ui.pairing.pairedCount
+    val nearby = rememberNearbyAccess()
+    val port = rememberSaveable { mutableStateOf("") }
 
     Column(modifier.fillMaxSize().imePadding().clearFocusOnTap().verticalScroll(rememberScrollState()).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Column(Modifier.padding(horizontal = 8.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             // Pairing again without an expired pairing means it came from Reconnect's "Full setup".
             Text(when {
-                    forSimSettings -> "Mobile data and roaming"
+                    purpose == SetupFor.SIM_SETTINGS -> "Mobile data and roaming"
                     ui.pairingExpired -> "Pair again"
+                    purpose == SetupFor.SWITCH -> "Set up Wireless debugging"
                     pairingAgain -> "Full setup"
                     else -> "Set up card access"
                 },
                 style = MaterialTheme.typography.headlineSmall, modifier = Modifier.semantics { heading() })
             Text(when {
-                    forSimSettings -> "Optional: your card already works without this. Android only lets apps " +
-                        "change mobile data and roaming through Wireless debugging, Shizuku or root. Pair this app, and " +
-                        "after a switch it sets the ones you tick, while Wireless debugging is on."
+                    purpose == SetupFor.SIM_SETTINGS -> "Optional: your card already works without this. Android only " +
+                        "lets apps change mobile data and roaming through Wireless debugging, Shizuku or root. Pair this " +
+                        "app, and after a switch it sets the ones you tick, while Wireless debugging is on."
                     ui.pairingExpired -> "This phone forgot the pairing. That happens after 7 days without " +
                         "connecting, or when it's removed under \"Paired devices\". Pairing again takes a minute."
+                    purpose == SetupFor.SWITCH -> "Card access stays as it is until this is done. Pair this app once, and " +
+                        "it reaches every card in your phone through Wireless debugging. Takes about 2 minutes."
                     pairingAgain -> "Rechecks each step and pairs this app again. Takes about a minute."
                     else -> "Takes about 2 minutes. No computer or root needed. You'll turn Wireless debugging back on " +
                         "after a restart or a Wi-Fi change."
@@ -408,14 +458,21 @@ private fun Checklist(ui: LpaUi, vm: LpaViewModel, modifier: Modifier, pairingAg
                 "\"Developer options\".", style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        if (!forSimSettings && !pairingAgain && !ui.pairing.active) CardCheck(ui, vm)
-        if (!forSimSettings) ui.error?.let { ErrorNote(it) }
-        if (!forSimSettings) WhyCard(onLearnMore = { AboutActivity.open(context, ui) })
-        if (ui.rootFound) RootOption(ui, vm)
-        ShizukuOption(ui, vm)
-        BankingNote(if (forSimSettings) "This app then can't set mobile data and roaming until you turn it back on " +
-            "(the same 7 taps)." else "Card access stops until you turn it back on (the same 7 taps). Your pairing " +
-            "stays saved.")
+        // Switching, the way was chosen already: no other ways, and errors come up over the pane.
+        val card = purpose == SetupFor.CARD
+        if (card && !pairingAgain && !ui.pairing.active) CardCheck(ui, vm)
+        if (card) ui.error?.let { ErrorNote(it) }
+        if (card) WhyCard(onLearnMore = { AboutActivity.open(context, ui) })
+        if (purpose != SetupFor.SWITCH) {
+            if (ui.rootFound) RootOption(ui, vm)
+            ShizukuOption(ui, vm)
+        }
+        BankingNote(when (purpose) {
+            SetupFor.SIM_SETTINGS -> "This app then can't set mobile data and roaming until you turn it back on (the " +
+                "same 7 taps)."
+            SetupFor.SWITCH -> "Until you turn it back on (the same 7 taps), this app uses another way to reach your card."
+            SetupFor.CARD -> "Card access stops until you turn it back on (the same 7 taps). Your pairing stays saved."
+        })
         Card(colors = CardDefaults.cardColors(containerColor = cardColor()),
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
             val devUnknown = s.developerOptions == null && !devConfirmed
@@ -424,7 +481,7 @@ private fun Checklist(ui: LpaUi, vm: LpaViewModel, modifier: Modifier, pairingAg
                 StepText("A hidden settings menu that the next steps need.")
                 // Android 17 may hide it from apps: then only Wireless debugging being on shows it's on.
                 if (s.developerOptions == null) StepText("This phone doesn't let apps check whether it's on. " +
-                    "If \"Developer options\" is already in Settings, tap \"It's on\".")
+                    "If \"Developer options\" is already in your phone's Settings, tap \"It's on\".")
                 StepText(developerOptionsHint())
                 AboutPhoneSketch(Modifier.padding(vertical = 4.dp))
                 StepText(developerOptionsElsewhere(), small = true)
@@ -458,7 +515,17 @@ private fun Checklist(ui: LpaUi, vm: LpaViewModel, modifier: Modifier, pairingAg
                 }
             }
             StepDivider()
-            Step(4, if (pairingAgain) "Pair again" else "Pair this app", "Not paired", state(3, false)) {
+            if (connectOnly) Step(4, "Pair this app", "Paired", state(3, false)) {
+                StepText("Tap \"Connect\" to switch card access to Wireless debugging.")
+                // Android 17: finding Wireless debugging's port needs "Nearby devices", or the port typed in.
+                StepButton("Connect") {
+                    if (ui.nearbyNeeded) nearby.ask(context) { if (it) vm.finishAccessSetup() } else vm.finishAccessSetup()
+                }
+                if (ui.nearbyNeeded) PortEntry(label = "Connect with a port number", button = "Connect with this port",
+                    help = "On the \"Wireless debugging\" page, look under \"IP address & Port\" and enter the number " +
+                        "after the colon.", portState = port, forceOpen = nearby.refused) { vm.finishAccessSetup(it) }
+                TextButton(onClick = { pairAgainAt = ui.pairing.pairedCount }) { Text("Pair again") }
+            } else Step(4, if (pairingAgain) "Pair again" else "Pair this app", "Not paired", state(3, false)) {
                 PairStep(ui, vm)
             }
         }
@@ -495,8 +562,8 @@ private fun ColumnScope.PairStep(ui: LpaUi, vm: LpaViewModel) {
             StepText("Android shows a 6-digit code in a pop-up. You type it into this app's notification, so the " +
                 "pop-up stays open:")
             // Most phones open the list around the "Wireless debugging" row, not its own page: no app can open that.
-            StepText("1. Tap \"Start pairing\". Settings opens. If you don't see \"Pair device with pairing code\", " +
-                "find \"Wireless debugging\" in the list and tap its name (not its switch).")
+            StepText("1. Tap \"Start pairing\". Your phone's Settings opens. If you don't see \"Pair device with " +
+                "pairing code\", find \"Wireless debugging\" in the list and tap its name (not its switch).")
             StepText("2. Tap \"Pair device with pairing code\".")
             PairCodeSketch(Modifier.padding(vertical = 4.dp))
             StepText("3. This app's notification drops down: tap \"Enter code\" on it and type the 6 digits. " +
@@ -650,7 +717,7 @@ private const val NEARBY_DEVICES = "android.permission.ACCESS_LOCAL_NETWORK"
 /** Asks for "Nearby devices" when finding Wireless debugging's ports needs it ([Pairing.canDiscover]): a short
  *  explanation first, since Android's own question talks of finding nearby devices, then Android's question. */
 @Stable
-private class NearbyAccess {
+internal class NearbyAccess {
     var explaining by mutableStateOf(false)
     /** Turned down: the app's settings page can still allow it. */
     var refused by mutableStateOf(false)
@@ -672,7 +739,7 @@ private class NearbyAccess {
 }
 
 @Composable
-private fun rememberNearbyAccess(): NearbyAccess {
+internal fun rememberNearbyAccess(): NearbyAccess {
     val access = remember { NearbyAccess() }
     val launcher = rememberLauncherForActivityResult(RequestPermission(), access::answered)
     if (access.explaining) AlertDialog(
@@ -695,7 +762,7 @@ private fun NearbyRefused(modifier: Modifier = Modifier) {
     val context = LocalContext.current
     Column(modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
         Text("Without \"Nearby devices\", enter Wireless debugging's port below. To allow it after all, open this " +
-            "app's settings, then Permissions.", style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center,
+            "app's page in your phone's Settings, then Permissions.", style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center,
             color = MaterialTheme.colorScheme.onSurfaceVariant)
         TextButton(onClick = { openAppSettings(context) }) { Text("Open app settings") }
     }
@@ -710,7 +777,7 @@ private fun NearbyRefused(modifier: Modifier = Modifier) {
 @Composable
 private fun ComputerSetup(ui: LpaUi, vm: LpaViewModel, modifier: Modifier, computerDone: MutableState<Boolean>,
                           port: MutableState<String>?, again: Boolean, onBack: (() -> Unit)?,
-                          forSimSettings: Boolean = false) {
+                          purpose: SetupFor = SetupFor.CARD) {
     val context = LocalContext.current
     BackHandler(enabled = onBack != null) { onBack?.invoke() }
     val s = ui.settings
@@ -723,21 +790,35 @@ private fun ComputerSetup(ui: LpaUi, vm: LpaViewModel, modifier: Modifier, compu
         i == current -> StepState.CURRENT
         else -> StepState.PENDING
     }
-    val connect = { if (forSimSettings) vm.setUpSimSettings() else vm.connect() }
+    // With a port people typed, or "" for the usual one.
+    val connect: (String) -> Unit = when (purpose) {
+        SetupFor.SIM_SETTINGS -> { _ -> vm.setUpSimSettings() }
+        SetupFor.SWITCH -> vm::finishAccessSetup
+        SetupFor.CARD -> vm::connect
+    }
+    val card = purpose == SetupFor.CARD
+    // Switching, an error from before this opened is the card screen's, about none of this.
+    val errorBefore by rememberSaveable { mutableStateOf(ui.error.takeIf { purpose == SetupFor.SWITCH }) }
 
     Column(modifier.fillMaxSize().imePadding().clearFocusOnTap().verticalScroll(rememberScrollState()).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Column(Modifier.padding(horizontal = 8.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(when {
-                    forSimSettings -> "Mobile data and roaming"
+                    purpose == SetupFor.SIM_SETTINGS -> "Mobile data and roaming"
+                    purpose == SetupFor.SWITCH -> "Set up USB debugging"
                     again -> "Full setup"
                     else -> "Set up with a computer"
                 },
                 style = MaterialTheme.typography.headlineSmall, modifier = Modifier.semantics { heading() })
             Text(when {
-                    forSimSettings -> "Optional: your card already works without this. Android only lets apps " +
-                        "change mobile data and roaming through its debugging tool, Shizuku or root. Set it up once, " +
-                        "and after a switch the app sets the ones you tick, until your phone restarts."
+                    purpose == SetupFor.SIM_SETTINGS -> "Optional: your card already works without this. Android only " +
+                        "lets apps change mobile data and roaming through its debugging tool, Shizuku or root. Set it " +
+                        "up once, and after a switch the app sets the ones you tick, until your phone restarts."
+                    // Android 9 and older reach a card outside SIM 1 this way only while one of its eSIMs is on.
+                    purpose == SetupFor.SWITCH -> "Card access stays as it is until this is done. " +
+                        (if (Build.VERSION.SDK_INT >= 29) "Android's debugging tool reaches every card in your phone. " +
+                            "Turning it on needs" else "Turning on Android's debugging tool needs") +
+                        " a computer once, and again after each restart. About 5 minutes the first time."
                     again -> "Rechecks each step and connects this app again."
                     else -> "Your card only lets its maker's app manage it, or it isn't inserted. This phone runs " +
                         "Android ${Build.VERSION.RELEASE}, so this app reaches the card through Android's debugging " +
@@ -746,15 +827,21 @@ private fun ComputerSetup(ui: LpaUi, vm: LpaViewModel, modifier: Modifier, compu
                 },
                 style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        if (!forSimSettings && !again) CardCheck(ui, vm)
+        if (card && !again) CardCheck(ui, vm)
         // Errors about connecting show by the Connect button, in the last step.
-        if (!forSimSettings && current != 3) ui.error?.let { ErrorNote(it) }
-        if (!forSimSettings) WhyCard(onLearnMore = { AboutActivity.open(context, ui) })
-        if (ui.rootFound) RootOption(ui, vm)
-        ShizukuOption(ui, vm)
-        BankingNote(if (forSimSettings) "This app then can't set mobile data and roaming until you turn Developer " +
-            "options and USB debugging back on." else "Card access stops until you turn Developer options and USB " +
-            "debugging back on.")
+        if (card && current != 3) ui.error?.let { ErrorNote(it) }
+        if (card) WhyCard(onLearnMore = { AboutActivity.open(context, ui) })
+        if (purpose != SetupFor.SWITCH) {
+            if (ui.rootFound) RootOption(ui, vm)
+            ShizukuOption(ui, vm)
+        }
+        BankingNote(when (purpose) {
+            SetupFor.SIM_SETTINGS -> "This app then can't set mobile data and roaming until you turn Developer options " +
+                "and USB debugging back on."
+            SetupFor.SWITCH -> "Until you turn Developer options and USB debugging back on, this app uses another way " +
+                "to reach your card."
+            SetupFor.CARD -> "Card access stops until you turn Developer options and USB debugging back on."
+        })
         Card(colors = CardDefaults.cardColors(containerColor = cardColor()),
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
             Step(1, "Developer options", if (devDone) "On" else "Off", state(0, devDone)) {
@@ -801,23 +888,26 @@ private fun ComputerSetup(ui: LpaUi, vm: LpaViewModel, modifier: Modifier, compu
                         "\"${allowButton()}\":")
                     KeyFingerprint(it)
                 } ?: StepText("Tick \"Always allow from this computer\" and tap \"${allowButton()}\".")
+                // One with a title is up in a dialog already, as a failed switch's is.
+                val error = ui.error?.takeIf { ui.errorTitle == null && it != errorBefore }
                 when {
                     // Nothing answered: the computer step didn't take (or the phone restarted since).
                     ui.portClosed -> {
                         ErrorNote("Nothing answered on this phone yet. Check that the computer said \"restarting " +
                             "in TCP mode port: ${AdbApduBackend.TCP_PORT}\", then tap \"Connect\" again.")
-                        ui.error?.takeIf { it != ui.explainedError }?.let { ErrorNote(it) }
+                        error?.takeIf { it != ui.explainedError }?.let { ErrorNote(it) }
                         TextButton(onClick = { computerDone.value = false }) { Text("Back to the computer step") }
                     }
-                    else -> ui.error?.let { ErrorNote(it) }
+                    else -> error?.let { ErrorNote(it) }
                 }
-                StepButton("Connect") { connect() }
+                StepButton("Connect") { connect("") }
                 StepText("After your phone restarts, it needs the computer again: steps 3 and 4. While this is on, " +
                     "other devices on your network can ask to connect too, so only tap \"${allowButton()}\" when this " +
                     "app asks.", small = true)
-                if (port != null && (ui.error != null || ui.portClosed)) PortEntry(label = "Used another port?",
-                    button = "Connect with this port", portState = port,
-                    help = "The number you typed after \"adb tcpip\".") { vm.connect(it) }
+                // Folded away: switching, a failure shows in a dialog that's gone by the time people look here.
+                if (port != null && (ui.error != null || ui.portClosed || purpose == SetupFor.SWITCH)) PortEntry(
+                    label = "Used another port?", button = "Connect with this port", portState = port,
+                    help = "The number you typed after \"adb tcpip\".") { connect(it) }
             }
         }
     }
@@ -1097,18 +1187,19 @@ const val APP_NAME = "eSIM\u00A0On\u2011SIM"
 // find the setting anyway.
 private fun developerOptionsHint() = "Open \"About phone\" and tap \"Build number\" 7\u00A0times."
 
+// "Your phone's Settings" where a bare "Settings" could be taken for this app's.
 private fun developerOptionsElsewhere() = "On some phones it's under \"Software information\", or called " +
-    "\"OS version\". Search Settings for \"Build number\" if you can't find it."
+    "\"OS version\". Search your phone's Settings for \"Build number\" if you can't find it."
 
 private fun developerOptionsDone() = "Enter your screen lock if asked. A message confirms when it's on."
 
 private fun wirelessDebuggingLocation() = "It's in ${path("Settings", "System", "Developer options")}, " +
-    "or search Settings for \"Wireless debugging\"."
+    "or search your phone's Settings for \"Wireless debugging\"."
 
 /** Android 7.1 and older list Developer options in Settings itself; 8 and newer under System. */
 private fun developerOptionsLocation(setting: String) = (if (Build.VERSION.SDK_INT >= 26)
-    "It's in ${path("Settings", "System", "Developer options")}" else "It's near the end of Settings, in " +
-    "\"Developer options\"") + ", or search Settings for \"$setting\"."
+    "It's in ${path("Settings", "System", "Developer options")}" else "It's near the end of your phone's Settings, " +
+    "in \"Developer options\"") + ", or search your phone's Settings for \"$setting\"."
 
 /** The button on this phone's "Allow USB debugging?" question that allows a computer, or this app. */
 internal fun allowButton() = AdbIdentity.allowButton()
@@ -1139,6 +1230,38 @@ fun simSubscription(context: Context, slot: Int): Int {
     }.getOrDefault(-1).takeIf { it != SubscriptionManager.INVALID_SUBSCRIPTION_ID } ?: -1
 }
 
+internal const val MOBILE_DATA = "mobile data"
+
+/** What of mobile data, calls and texts Android has on SIM subscription [sub], in that order. Public getters that need no
+ *  permission, from Android 10, where [simSubscription] can say which subscription a slot has. */
+fun defaultsOn(sub: Int): List<String> {
+    if (sub < 0 || Build.VERSION.SDK_INT < 29) return emptyList()
+    return runCatching {
+        listOfNotNull(MOBILE_DATA.takeIf { SubscriptionManager.getDefaultDataSubscriptionId() == sub },
+            "calls".takeIf { SubscriptionManager.getDefaultVoiceSubscriptionId() == sub },
+            "texts".takeIf { SubscriptionManager.getDefaultSmsSubscriptionId() == sub })
+    }.getOrDefault(emptyList())
+}
+
+/** "a", "a and b", "a, b and c"; with [word] "or", "a, b or c". */
+fun listed(items: List<String>, word: String = "and") = if (items.size < 2) items.joinToString() else
+    items.dropLast(1).joinToString(", ") + " $word " + items.last()
+
+/** Whether mobile data is on a SIM other than [slot]'s (Android's own number), so making this one the data SIM takes
+ *  it from there: Android then turns mobile data off on that one. Null when that can't be told. */
+fun dataElsewhere(context: Context, slot: Int): Boolean? {
+    if (slot < 0 || Build.VERSION.SDK_INT < 29) return null
+    val here = simSubscription(context, slot)
+    return runCatching { SubscriptionManager.getDefaultDataSubscriptionId() }.getOrNull()
+        ?.let { data -> data != SubscriptionManager.INVALID_SUBSCRIPTION_ID && data != here }
+}
+
+/** How many SIM slots the phone has, also ones it isn't using now. Needs no permission. */
+fun simSlots(context: Context): Int = runCatching {
+    val t = context.getSystemService(TelephonyManager::class.java) ?: return 1
+    if (Build.VERSION.SDK_INT >= 30) t.supportedModemCount else @Suppress("DEPRECATION") t.phoneCount
+}.getOrDefault(1)
+
 /** No SIM in any slot, as far as Android says. Needs no permission. */
 fun noSimInPhone(context: Context): Boolean = runCatching {
     val t = context.getSystemService(TelephonyManager::class.java) ?: return false
@@ -1166,7 +1289,7 @@ fun openSimSettings(context: Context, slot: Int?, notSub: Int) {
 private fun openAboutPhone(context: Context) = launch(context,
     listOf(Intent(Settings.ACTION_DEVICE_INFO_SETTINGS), Intent(Settings.ACTION_SETTINGS)))
 
-private fun openShizuku(context: Context) {
+internal fun openShizuku(context: Context) {
     context.packageManager.getLaunchIntentForPackage(ShizukuClient.MANAGER)?.let { launch(context, listOf(it)) }
 }
 

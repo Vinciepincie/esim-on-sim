@@ -193,6 +193,19 @@ class Asn1Test {
             Es9Client.describe("8.1", "4.8"))
         assertEquals("The eSIM provider refused the request. Ask your provider for help and quote this code.",
             Es9Client.describe("8.9", "1.1"))
+        // What people can do decides the words: nothing, for a provider that won't serve the card.
+        for ((subject, reason) in listOf("8.8.2" to "3.1", "8.8.3" to "3.1", "8.8.4" to "3.7", "8.1.2" to "6.1",
+                "8.1.3" to "6.1", "8.11.1" to "3.9", "8.1" to "6.1"))
+            assertTrue(subject, Es9Client.describe(subject, reason).startsWith("This provider doesn't accept this eSIM card"))
+        // A server's execution error may well pass: worth another go.
+        assertTrue(Es9Client.describe("8.8", "4.2").startsWith("The provider couldn't serve this eSIM card. If trying again"))
+        assertTrue(Es9Client.describe("8.2", "1.2").startsWith("This eSIM isn't ready to download yet"))
+        assertTrue(Es9Client.describe("8.2", "3.7").startsWith("This eSIM can't be downloaded any more"))
+        // No eSIM for this card or phone isn't one downloaded already, so a new code wouldn't help.
+        assertTrue(Es9Client.describe("8.2.5", "4.3").startsWith("The provider says this eSIM can't be used on this card"))
+        assertEquals("The provider lost track of this download. Try again.", Es9Client.describe("8.10.1", "3.9"))
+        // A reason that means the same whatever the subject still wins.
+        assertTrue(Es9Client.describe("8.8.2", "4.8").startsWith("The card doesn't have room"))
         assertArrayEquals(byteArrayOf(1, 2, 3), Es9Client.unb64("AQ\nID"))
     }
 }

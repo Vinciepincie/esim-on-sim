@@ -83,7 +83,8 @@ class AdbApduBackend(context: Context) : ApduBackend, AutoCloseable {
     private val context = context.applicationContext
     private val prefs = this.context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
     private var manager: AdbIdentity? = null
-    /** A connection waiting for the phone's "Allow USB debugging?" answer; [cancelConnect] ends it. */
+    /** A connection waiting for the phone's "Allow USB debugging?" answer, or on Android 11 and newer any connection
+     *  under way; [cancelConnect] ends it. */
     @Volatile private var asking: AdbIdentity? = null
     @Volatile private var cancelled = false
     @Volatile private var stream: AdbStream? = null
@@ -120,30 +121,39 @@ class AdbApduBackend(context: Context) : ApduBackend, AutoCloseable {
         if (Build.VERSION.SDK_INT < 30) return connectOverTcp(port, authorize)
         val adb = AdbIdentity(context)
         manager = adb
+        // A switch to it can be cancelled midway (see cancelConnect).
+        cancelled = false
+        asking = adb
         try {
             // The port that worked last time goes first: it holds until Wireless debugging is switched off, and a
             // closed port on this phone is refused at once, so only a new port costs the mDNS search.
             val last = if (port == null) Pairing.lastPort(context) else null
             val target = if (last != null && reuse(adb, last)) last else {
+                if (cancelled) throw ConnectCancelledException()
                 // Android 17 only lets apps search with "Nearby devices", which the app asks for on screen. Only
                 // worth asking while Wireless debugging may be on, not to find what isn't there (a saved helper
                 // alone can lead here).
                 if (port == null && !Pairing.canDiscover(context))
                     throw if (DebugSettings.read(context).mayConnect) NearbyDevicesNeededException() else PortNotFoundException()
                 val found = port ?: Pairing.findConnectPort(context, 6000) ?: throw PortNotFoundException()
+                // The search itself runs to its end.
+                if (cancelled) throw ConnectCancelledException()
                 check(adb.connect("127.0.0.1", found) || adb.isConnected) { "Could not connect to wireless debugging." }
                 found
             }
+            if (cancelled) throw ConnectCancelledException()
             startOver(adb, target)
         } catch (e: Exception) {
             disconnect()
+            // Not a pairing problem, whatever closing the connection midway threw.
+            if (cancelled) throw ConnectCancelledException()
             if (e is NearbyDevicesNeededException || e is PortNotFoundException) throw e
             if (e.isPairingProblem()) {
                 Pairing.forget(context) // e.g. "Forget" in Wireless debugging's paired devices list
                 throw PairingRequiredException(e)
             }
             throw IOException(NOT_CONNECTED, e)
-        }
+        } finally { asking = null }
     }
 
     private fun Throwable.isPairingProblem() = generateSequence(this) { it.cause }
@@ -226,7 +236,9 @@ class AdbApduBackend(context: Context) : ApduBackend, AutoCloseable {
     }
 
     /** Gives up waiting for the phone's "Allow USB debugging?" answer: [connect] then fails at once, with an
-     *  [AllowNeededException]. Any thread; nothing happens when no connection is waiting. */
+     *  [AllowNeededException]. On Android 11 and newer, for Wireless debugging to connect: [connect] fails with a
+     *  [ConnectCancelledException], once a search for its port that's under way ended. Any thread; nothing happens
+     *  when no connection is under way. */
     fun cancelConnect() {
         val waiting = asking ?: return
         cancelled = true
@@ -375,9 +387,7 @@ class AdbApduBackend(context: Context) : ApduBackend, AutoCloseable {
         }
     }
 
-    override fun slots(): List<SlotInfo> = rpc(JSONObject().put("op", "slots")).getJSONArray("slots").let { all ->
-        List(all.length()) { i -> all.getJSONObject(i).let { SlotInfo(it.optBoolean("euicc"), it.optBoolean("removable", true)) } }
-    }
+    override fun slots(): List<SlotInfo> = SlotInfo.list(rpc(JSONObject().put("op", "slots")).getJSONArray("slots"))
 
     private fun request(op: String, slot: Int, port: Int, channel: Int = 0) = JSONObject()
         .put("op", op).put("slot", slot).put("port", port).put("channel", channel)

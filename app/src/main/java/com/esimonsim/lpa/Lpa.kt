@@ -4,13 +4,18 @@ import android.util.Log
 import com.esimonsim.adb.CardShell
 import com.esimonsim.apdu.ApduBackend
 import com.esimonsim.apdu.ApduException
+import com.esimonsim.apdu.OpenResult
+import com.esimonsim.apdu.SlotInfo
 import com.esimonsim.es9.Es9Client
 import com.esimonsim.es9.Es9Client.Companion.b64
 import com.esimonsim.es9.Es9Client.Companion.unb64
 import java.io.ByteArrayOutputStream
-import java.io.IOException
 import java.math.BigInteger
+import java.net.ConnectException
+import java.net.NoRouteToHostException
+import java.net.UnknownHostException
 import java.security.MessageDigest
+import javax.net.ssl.SSLHandshakeException
 
 /** Which SIM slots the card can be reached in. Below Android 10 the card helper (adb/CardShell) reaches a card
  *  only through Android's own SIM for that slot. */
@@ -54,6 +59,17 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
         internal const val NOT_FOUND_FIRST_OR_ACTIVE = "Couldn't find the eSIM card. On this version of Android, " +
             "the app can only reach it in SIM 1, or in another SIM slot while one of its eSIMs is on. Check that " +
             "it's inserted, in SIM 1 if you can, then try again." + CARD_BUSY_TIP
+        private const val LOCKED_START = "The eSIM card in SIM "
+        private const val LOCKED_END = " doesn't let this app in directly. Tap \"Change card access\" to choose a " +
+            "way that reaches it."
+        /** No card let this app in, but the one in SIM [sim] (from 1) is an eSIM card that refuses direct access. */
+        internal fun notFoundLocked(sim: Int) = "$LOCKED_START$sim$LOCKED_END"
+        /** [message] is [notFoundLocked]'s, so another way in is what helps. */
+        internal fun isLockedOnly(message: String?) =
+            message != null && message.startsWith(LOCKED_START) && message.endsWith(LOCKED_END)
+        /** The SIM (from 1) a [notFoundLocked] message is about, or null for any other message. */
+        internal fun lockedSim(message: String?) = message?.takeIf(::isLockedOnly)
+            ?.removePrefix(LOCKED_START)?.removeSuffix(LOCKED_END)?.toIntOrNull()
         /** A card outside SIM 1 that Android 7-9 no longer has a SIM for (see [SlotReach.FIRST_OR_ACTIVE]). */
         internal const val OUT_OF_REACH = "The card can't be reached right now. On this version of Android, the " +
             "app can only reach a card outside SIM 1 while one of its eSIMs is on. Wait a moment and try again, " +
@@ -63,10 +79,10 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
             "another eSIM instead, or move the card to SIM 1."
         private const val UNREADABLE = "The card sent an answer this app can't read. Try again."
         private const val NO_CHALLENGE = "The card didn't respond properly. Try again."
-        private const val INSTALL_UNKNOWN = "The card didn't say whether the install worked. Close this screen and " +
+        internal const val INSTALL_UNKNOWN = "The card didn't say whether the install worked. Close this screen and " +
             "refresh your list before trying again."
         internal const val GONE = "That eSIM isn't on the card any more. Refresh the list."
-        internal const val OTHER_CARD = "A different card is in the phone now. Refresh the list, then try again."
+        internal const val OTHER_CARD = "A different card is in that SIM slot now. Refresh the list, then try again."
         private const val TAG = "LPA"
         /** The GSMA's root discovery server, for cards that don't name one. */
         const val GSMA_SMDS = "lpa.ds.gsma.com"
@@ -138,7 +154,9 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
 
     private enum class Op(val verb: String) { ENABLE("turn on"), DISABLE("turn off"), DELETE("delete"), RENAME("rename") }
 
-    data class DownloadOutcome(val profileName: String, val iccid: String?)
+    /** [confirmed]: the card's install result said it worked. False when its answer held no result at all, which
+     *  no card that follows SGP.22 sends: then only the list on the card can say. */
+    data class DownloadOutcome(val profileName: String, val iccid: String?, val confirmed: Boolean = true)
 
     /** Null fields: the card didn't report them. [standard] is the SGP.22 version it follows; [roots] are
      *  the key IDs of the root certificates it accepts eSIMs under, named in [rootNames]. */
@@ -173,10 +191,25 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
     /** The phone reports the slot [discover] found the card in as built in, or can't say which slots are: it may well
      *  be its own eSIM chip, not a removable card. */
     var onBuiltInSlot = false; private set
-    /** The card [discover] found, which is the one on screen. */
+    /** A card that isn't the one [discover] found, in a slot the phone isn't using, if the phone said so. */
+    var idleSlot = -1; private set
+    /** The card this object works on, once [discover] found it or [at] said which. */
     private var eid: String? = null
     /** The eSIM manager ID that card answered to: one of [CardShell.ISD_R_AIDS]. */
     private var isdR = ISD_R_OPEN
+
+    /** The card this object works on, with where it answers; null before [discover] found one. */
+    val card: Card? get() = eid?.let { Card(it, slot, isdR, onBuiltInSlot) }
+
+    /** An object of its own for [card]. Each card has one, so an operation stays on its card whatever is in view. */
+    fun at(card: Card) = sibling().also {
+        it.slot = card.slot; it.isdR = card.isdR; it.eid = card.eid; it.onBuiltInSlot = card.builtIn
+    }
+
+    /** A new object to [discover] with, which starts where this one found its card, so a refresh costs what it did. */
+    fun again(sameSlot: Boolean = true) = sibling().also { if (sameSlot) it.slot = slot; it.isdR = isdR }
+
+    private fun sibling() = Lpa(backend, phoneHasEsim, slotReach, transport, accessRulesApply)
 
     // ---------------- connection / discovery ----------------
 
@@ -205,6 +238,7 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
         val tries = (others.map { it to isdR } + builtInSlots.filter { it == slotHint }.map { it to isdR } +
             listOf(others, builtInSlots).flatMap { group -> ids.flatMap { id -> group.map { it to id } } }).distinct()
         val noCard = HashSet<Int>()
+        val lockedSlots = HashSet<Int>() // eSIM cards that refuse this way in
         for ((s, id) in tries) {
             if (s in noCard) continue
             try {
@@ -213,14 +247,21 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
                 cardAnswered = true
                 if (r.channel > 0) {
                     // isdR only once the EID has been read: a maker's ID may select something that's no eSIM manager.
-                    try { slot = s; port = 0; return readEid(r.channel).also { eid = it; isdR = id; onBuiltInSlot = unknown || s in builtIn } }
-                    catch (e: Throwable) {
+                    try {
+                        slot = s; port = 0
+                        return readEid(r.channel).also {
+                            eid = it; isdR = id; onBuiltInSlot = unknown || s in builtIn
+                            idleSlot = reported.withIndex().firstOrNull { (i, o) ->
+                                i != s && o.euicc && o.present != false && o.active == false }?.index ?: -1
+                        }
+                    } catch (e: Throwable) {
                         slot = lastSlot // sendEs10 needs it set; a list still on screen belongs to the last one
                         if (cardFailure == null && s !in builtIn) cardFailure = e
                         throw e
                     } finally { backend.closeChannel(s, 0, r.channel) }
                 }
                 if (r.status == 2) noCard += s // no card, or a slot this Android can't reach
+                if (r.status == OpenResult.LOCKED) lockedSlots += s
                 errors.append("slot$s:status=${r.status} ")
             } catch (e: Throwable) {
                 if (failure == null) failure = e
@@ -233,11 +274,87 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
         // Not any slot that threw: slots past the phone's last do, on Android 10+.
         if (failure != null && (!cardAnswered || !backend.isReady())) throw failure
         Log.w(TAG, "No eSIM card answered: ${errors.trim()}") // slots count from 0 here, from SIM 1 in the app
+        // Said, though direct access stays: a card restarting after a switch can look the same for a moment.
+        if (lockedSlots.isNotEmpty() && slotReach() == SlotReach.ALL) throw ApduException(notFoundLocked(lockedSlots.min() + 1))
         throw ApduException(when (slotReach()) {
             SlotReach.ALL -> NOT_FOUND
             SlotReach.FIRST_OR_ACTIVE -> NOT_FOUND_FIRST_OR_ACTIVE
             SlotReach.FIRST_ONLY -> NOT_FOUND_FIRST_ONLY
         })
+    }
+
+    /** Looks through the phone's slots for cards besides the one in [inView]: read here, on the channel that gave the
+     *  EID, so a card nobody's looking at shows up with its eSIMs for one command more. Costs the card nothing for a slot
+     *  whose [SlotInfo.token] is the one in [seen]. Slots the phone is sure of are left unopened: those it says are empty,
+     *  those it isn't using (opening one throws), and those in [skip], where a card has hung. [own]: EIDs people said are
+     *  theirs, as a built-in chip stays out of this unless it's one. [ordinary]: an earlier look found no eSIM manager
+     *  behind that token. With no token to go by, makers' IDs aren't worth trying at every look, and with [quick] the slot
+     *  isn't looked at. [go] false stops it between slots. Never throws for a card, and moves nothing here. */
+    fun scan(inView: Int, seen: Map<Int, String> = emptyMap(), own: Set<String> = emptySet(),
+             ordinary: (Int, String) -> Boolean = { _, _ -> false }, skip: Set<Int> = emptySet(), quick: Boolean = false,
+             go: () -> Boolean = { true }): List<SlotLook> {
+        if (slotReach() == SlotReach.FIRST_ONLY) return emptyList() // only ever one card to reach
+        val reported = runCatching { backend.slots() }.getOrDefault(emptyList())
+        val unknown = phoneHasEsim && reported.isEmpty() && !accessRulesApply()
+        val looks = ArrayList<SlotLook>()
+        for (s in if (reported.isEmpty()) 0..3 else reported.indices) {
+            if (!go()) break
+            val info = reported.getOrNull(s)
+            val token = info?.token
+            // The tray of a misreported card counts too: this only keeps it out of the list until people say it's theirs.
+            val chip = unknown || (phoneHasEsim && info != null && info.euicc && !info.removable)
+            // [keep] false: decided from Android's list alone, so the token isn't one to skip the slot by next time. A
+            // slot turned on keeps its token, and asking Android again costs nothing.
+            fun look(what: SlotLook.What, found: Card? = null, list: List<EuiccProfile>? = null, noManager: Boolean = false,
+                     keep: Boolean = true) {
+                looks += SlotLook(s, what, found, list, info?.logical, token.takeIf { keep }, noManager)
+            }
+            when {
+                s == inView -> look(SlotLook.What.SAME)
+                // What Android is sure of costs nothing to ask, so it goes before anything that would skip the slot.
+                info?.present == false -> look(SlotLook.What.EMPTY, keep = false)
+                info != null && info.active == false ->
+                    look(if (info.euicc && !chip) SlotLook.What.IDLE else SlotLook.What.EMPTY, keep = false)
+                s in skip || (quick && token == null) -> look(SlotLook.What.AGAIN)
+                token != null && seen[s] == token -> look(SlotLook.What.SAME)
+                token != null && ordinary(s, token) -> look(SlotLook.What.EMPTY)
+                chip && (info?.eid?.let { it !in own } ?: own.isEmpty()) -> look(SlotLook.What.EMPTY)
+                // Card access went for some other reason: no slot is to blame for that.
+                !backend.isReady() -> return looks
+                else -> {
+                    val result = try { probe(s, info, chip, own) } catch (e: Exception) {
+                        Log.i(TAG, "slot $s: ${e.javaClass.simpleName}")
+                        SlotLook(s, SlotLook.What.AGAIN)
+                    }
+                    // Card access went during this slot, also where reading its list failed quietly: this one's to blame.
+                    if (!backend.isReady()) { look(SlotLook.What.HUNG); return looks }
+                    look(result.what, result.card, result.profiles, result.noManager)
+                }
+            }
+        }
+        return looks
+    }
+
+    /** Opens [s] under each ID in turn until one answers, and reads the card behind it. */
+    private fun probe(s: Int, info: SlotInfo?, chip: Boolean, own: Set<String>): SlotLook {
+        var noManager = info != null && info.token != null && !info.euicc
+        for (id in if (info?.token == null) listOf(ISD_R_OPEN) else CardShell.ISD_R_AIDS) {
+            val r = backend.openChannel(s, 0, id)
+            if (r.status == OpenResult.LOCKED) return SlotLook(s, SlotLook.What.LOCKED)
+            if (r.channel > 0) try {
+                val card = at(Card("", s, id, chip))
+                val found = card.readEid(r.channel)
+                if (chip && found !in own) return SlotLook(s, SlotLook.What.EMPTY)
+                // A card that won't list its eSIMs is still a card to switch to, where the failure gets said.
+                val list = runCatching { card.readProfiles(r.channel) }.getOrNull()
+                return SlotLook(s, SlotLook.What.CARD, Card(found, s, id, chip), list)
+            } finally { backend.closeChannel(s, 0, r.channel) }
+            // No card, but also no free channel: with the list saying there is one, it's the card that's busy.
+            if (r.status == 2) return SlotLook(s, if (info != null && info.present == true && info.active == true)
+                SlotLook.What.AGAIN else SlotLook.What.EMPTY)
+            if (r.status != 3) noManager = false // only "no such applet" says there's none
+        }
+        return SlotLook(s, SlotLook.What.EMPTY, noManager = noManager)
     }
 
     /** The card is outside SIM 1 where Android 7-9 reach it only through the SIM of an eSIM that's on. */
@@ -246,8 +363,12 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
     private inline fun <T> withIsdR(block: (Int) -> T): T {
         check(slot >= 0) { "call discover() first" }
         val r = backend.openChannel(slot, port, isdR)
-        if (r.channel <= 0) throw ApduException(if (r.status == 2 && reachedOnlyWhileOn()) OUT_OF_REACH
-            else "Couldn't open the card (status ${r.status}). Try again.")
+        if (r.channel <= 0) throw ApduException(when {
+            r.status == 2 && reachedOnlyWhileOn() -> OUT_OF_REACH
+            // Direct access, and the card there now refuses it: swapped for another.
+            r.status == OpenResult.LOCKED -> notFoundLocked(slot + 1)
+            else -> "Couldn't open the card (status ${r.status}). Try again."
+        })
         try { return block(r.channel) } finally { backend.closeChannel(slot, port, r.channel) }
     }
 
@@ -309,12 +430,22 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
 
     fun getProfiles(): List<EuiccProfile> = withIsdR { ch -> readProfiles(ch) }
 
+    /** The eSIMs on this object's card, at the address it has, on one channel. It looks nowhere else, so when someone chose
+     *  this card, its absence is what gets said, not another card's list. */
+    fun read(): List<EuiccProfile> = withIsdR { ch ->
+        if (readEid(ch) != eid) throw ApduException(OTHER_CARD)
+        readProfiles(ch)
+    }
+
     private fun readProfiles(ch: Int): List<EuiccProfile> {
-        val root = Tlv.parse(sendEs10(ch, PROFILES_REQUEST)) ?: throw ApduException(UNREADABLE)
+        val root = Tlv.parse(sendEs10(ch, PROFILES_REQUEST))?.takeIf { it.tag == 0xBF2D } ?: throw ApduException(UNREADABLE)
         // profileInfoListError: not an empty list. A direct child only, as tag 81 means other things further down.
         root.children.firstOrNull { it.tag == 0x81 }?.let { e ->
             throw ApduException("The card couldn't list its eSIMs (code ${e.value.firstOrNull()?.toInt()?.and(0xFF)}). Try again.")
         }
+        // No list and no eSIM in it: an answer that says nothing, not an empty card. Taken as one, a re-read would
+        // confirm a delete or a turn-off that never happened. An empty card sends an empty list (A0).
+        if (root.children.none { it.tag == 0xA0 } && root.find(0xE3) == null) throw ApduException(UNREADABLE)
         return root.findAll(0xE3).map { e3 ->
             EuiccProfile(
                 iccid = e3.find(0x5A)?.value?.let { iccid(it) } ?: "",
@@ -353,20 +484,22 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
 
     /** Refused before the card is touched where turning the eSIM off would put the card out of reach: the cards
      *  Android 7-9 work with have one eSIM on at a time (several at once needs Android 13), so it's the last one.
-     *  Deleting needs no such check, as the card won't delete an eSIM that's on. */
-    fun disable(p: EuiccProfile) {
+     *  Deleting needs no such check, as the card won't delete an eSIM that's on. True when the card said it's done. */
+    fun disable(p: EuiccProfile): Boolean {
         if (reachedOnlyWhileOn()) throw ApduException(LAST_ESIM_ON)
-        setState(p, enable = false)
+        return setState(p, enable = false)
     }
 
-    private fun setState(p: EuiccProfile, enable: Boolean) = withIsdR { ch ->
+    /** True when the card answered that it's done; false when its answer was lost, which a switch's restart can do. */
+    private fun setState(p: EuiccProfile, enable: Boolean): Boolean = withIsdR { ch ->
         requireOnCard(ch, p) // outside the try below: nothing has been sent yet, so this failure always counts
         val choice = Tlv.build(0xA0, Tlv.build(0x4F, Hex.decode(p.isdpAid)))
         val req = Tlv.buildSeq(if (enable) 0xBF31 else 0xBF32, choice, REFRESH)
         // Both make the card REFRESH, which can drop the reply; the caller
         // re-reads the profile list to confirm.
-        val resp = try { sendEs10(ch, req) } catch (_: ApduException) { return@withIsdR }
+        val resp = try { sendEs10(ch, req) } catch (_: ApduException) { return@withIsdR false }
         checkResult(resp, if (enable) Op.ENABLE else Op.DISABLE)
+        true
     }
 
     fun delete(p: EuiccProfile) = withIsdR { ch ->
@@ -375,13 +508,17 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
     }
 
     /** ES10c SetNickname: the name is stored on the card, so other phones and apps show it too.
-     *  An empty [nickname] clears it, and the provider's own name shows again. */
-    fun setNickname(iccid: String, nickname: String) {
+     *  An empty [nickname] clears it, and the provider's own name shows again. True when the card answered that it's
+     *  done; false when its answer held no result, and then the list on the card has to say. */
+    fun setNickname(iccid: String, nickname: String): Boolean {
         val name = nickname.trim().toByteArray(Charsets.UTF_8)
         if (name.size > MAX_NICKNAME_BYTES) throw ApduException("That name is too long. Use a shorter one.")
-        withIsdR { ch ->
-            val req = Tlv.buildSeq(0xBF29, Tlv.build(0x5A, iccidBytes(iccid)), Tlv.build(0x90, name))
-            checkResult(sendEs10(ch, req), Op.RENAME)
+        return withIsdR { ch ->
+            val resp = sendEs10(ch, Tlv.buildSeq(0xBF29, Tlv.build(0x5A, iccidBytes(iccid)), Tlv.build(0x90, name)))
+            // Only a rename's own answer says how it went.
+            if (Tlv.parse(resp)?.takeIf { it.tag == 0xBF29 }?.find(0x80) == null) return@withIsdR false
+            checkResult(resp, Op.RENAME)
+            true
         }
     }
 
@@ -420,8 +557,11 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
         (notices - stale).mapNotNull { n -> retrieveNotification(ch, n.seq)?.let { n.copy(signed = b64(it)) } }
     }
 
-    /** Clear notices from the card once their providers have them. */
-    fun removeNotifications(seqs: Collection<Int>) = withIsdR { ch -> seqs.forEach { removeNotification(ch, it) } }
+    /** Clear notices from the card once their providers have them. Sending takes a while with the card left free, and a
+     *  sequence number only means something on the card that gave it, so another card put in meanwhile keeps its own. */
+    fun removeNotifications(seqs: Collection<Int>) = withIsdR { ch ->
+        if (readEid(ch) == eid) seqs.forEach { removeNotification(ch, it) }
+    }
 
     /** Send [n] to its provider. Doesn't use the card. True when it needn't be sent again. */
     fun deliver(n: Notification): Boolean = n.signed == null ||
@@ -525,8 +665,8 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
             val authServerResp = authenticateServer(ch, init, ac.matchingId)
 
             progress(Step.VERIFY_CARD, 0f)
-            val authClient = es9.authenticateClient(init.transactionId, b64(authServerResp))
-            val result = try {
+            val (result, metadata) = try {
+                val authClient = es9.authenticateClient(init.transactionId, b64(authServerResp))
                 // The provider names the eSIM's ICCID here, before anything is downloaded.
                 parseMetadata(authClient.profileMetadata).iccid?.takeIf { it in installed }?.let { throw AlreadyOnCardException(it) }
 
@@ -537,20 +677,32 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
                 val bpp = unb64(es9.getBoundProfilePackage(init.transactionId, b64(prep)))
 
                 progress(Step.INSTALL, 0f)
-                loadBpp(ch, bpp) { progress(Step.INSTALL, it) }
+                loadBpp(ch, bpp) { progress(Step.INSTALL, it) } to authClient.profileMetadata
             } catch (e: Exception) {
-                // A server refusal already ended the procedure, and without a network the notice can't go.
-                if (e !is Es9Client.Es9Exception && e !is IOException) cancelSession(ch, es9, init.transactionId)
+                if (leftASession(e)) cancelSession(ch, es9, init.transactionId)
                 throw e
             }
 
             // Report the outcome to the SM-DP+, then clear the card's copy of it. If it couldn't be
-            // sent, the copy stays and is sent later with the other notices.
-            if (es9.handleNotification(b64(result))) Tlv.parse(result)?.find(0xBF2F)?.find(0x80)?.value?.let { seq ->
-                runCatching { removeNotification(ch, BigInteger(seq).toInt()) }
-            }
-            verifyInstall(result)
-            parseMetadata(authClient.profileMetadata)
+            // sent, the copy stays and is sent later with the other notices. An answer with no outcome isn't one.
+            if (installOutcome(result) != null && es9.handleNotification(b64(result)))
+                Tlv.parse(result)?.find(0xBF2F)?.find(0x80)?.value?.let { seq ->
+                    runCatching { removeNotification(ch, BigInteger(seq).toInt()) }
+                }
+            val confirmed = verifyInstall(result)
+            parseMetadata(metadata).copy(confirmed = confirmed)
+        }
+    }
+
+    /** Whether the provider may still hold this download's session after [e]: it got the request, but no clear answer
+     *  came back (a server error, a garbled reply, a dropped connection), or the card failed. Ended, it doesn't keep
+     *  the next try waiting. Not after the provider's own refusal, which ends it, a hand-over to another server, or a
+     *  connection that never got there. */
+    internal fun leftASession(e: Throwable): Boolean = when (e) {
+        is Es9Client.Handover -> false
+        is Es9Client.Es9Exception -> e.subject.isEmpty()
+        else -> generateSequence(e) { it.cause }.none {
+            it is UnknownHostException || it is ConnectException || it is NoRouteToHostException || it is SSLHandshakeException
         }
     }
 
@@ -578,8 +730,15 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
                 unb64(init.euiccCiPKIdToBeUsed) + unb64(init.serverCertificate) + ctxParams1
         val resp = sendEs10(ch, Tlv.build(0xBF38, value))
         // The procedure stops here (SGP.22 3.0.1): a server the card turned down doesn't get to steer the rest.
-        if (cardRefusedServer(resp))
-            throw Es9Client.Es9Exception("Your card didn't accept this provider's certificate, so nothing was installed.")
+        if (cardRefusedServer(resp)) {
+            // AuthenticateErrorCode: noSessionContext(4) and euiccChallengeMismatch(6) are about this attempt, not the
+            // provider. Nothing has reached the provider yet that could use up the code.
+            val code = Tlv.parse(resp)?.children?.firstOrNull()?.children?.firstOrNull { it.tag == 0x02 }?.value
+                ?.lastOrNull()?.toInt()?.and(0xFF)
+            Log.w(TAG, "card refused the server: $code")
+            throw Es9Client.Es9Exception(if (code == 4 || code == 6) "The card lost track of this download. Try again."
+                else "Your card didn't accept this provider's certificate, so nothing was installed.")
+        }
         return resp
     }
 
@@ -626,19 +785,29 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
         throw ApduException(INSTALL_UNKNOWN)
     }
 
-    /** ProfileInstallationResult -> success, or a user-facing reason (SGP.22 ErrorReason). */
-    internal fun verifyInstall(result: ByteArray) {
-        val root = Tlv.parse(result) ?: throw ApduException(INSTALL_UNKNOWN)
-        val node = (root.find(0xBF27) ?: root).find(0xA2)?.children?.firstOrNull()
-        if (node == null) { Log.w(TAG, "install result unparsed: ${result.size} bytes"); return } // it can hold the ICCID
-        if (node.tag == 0xA0) return // successResult
+    /** ProfileInstallationResult's finalResult: successResult (A0) or errorResult (A1). Null when the answer has none. */
+    private fun installOutcome(result: ByteArray): Tlv? =
+        Tlv.parse(result)?.let { root -> (root.find(0xBF27) ?: root).find(0xA2)?.children?.firstOrNull() }
+
+    /** ProfileInstallationResult -> true for success, false when it holds no result, or a user-facing reason
+     *  (SGP.22 ErrorReason). */
+    internal fun verifyInstall(result: ByteArray): Boolean {
+        val node = installOutcome(result)
+        if (node == null) { Log.w(TAG, "install result unparsed: ${result.size} bytes"); return false } // it can hold the ICCID
+        if (node.tag == 0xA0) return true // successResult
         val reason = node.find(0x81)?.value?.firstOrNull()?.toInt()
+        // Which part of the package the card stopped at: for the log, as nobody can act on it.
+        Log.w(TAG, "install failed: reason $reason at command ${node.find(0x80)?.value?.firstOrNull()}")
         throw ApduException(when (reason) {
             9 -> "This eSIM is already on the card."
             10 -> CARD_FULL
             11 -> "The install was interrupted. Try again."
-            else -> "The card couldn't install this eSIM (error ${reason ?: "unknown"}). The activation code often " +
-                "still works after a failed install, so try again. If it fails again, ask your provider for help and " +
+            // Damaged on the way, or out of step: another download of the same eSIM may well work.
+            7, 8 -> "The eSIM was damaged on the way to the card (error $reason). Try again."
+            // Something about this eSIM this card can't take: the same eSIM fails the same way.
+            4, 5, 6, 13, 15 -> "This eSIM can't be installed on this card (error $reason). Ask your provider for a " +
+                "different eSIM or a refund, and quote that number."
+            else -> "The card couldn't install this eSIM (error ${reason ?: "unknown"}). Ask your provider for help and " +
                 "quote that number."
         })
     }

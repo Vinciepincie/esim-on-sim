@@ -15,6 +15,9 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.net.ConnectException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 
 /** The whole download against a scripted card and a scripted provider: real ES10 and real ES9+ JSON. */
 class DownloadTest {
@@ -183,6 +186,19 @@ class DownloadTest {
         }
     }
 
+    @Test fun anAnswerWithNoInstallResultIsNotCalledAnInstallNorPassedOn() {
+        // A card that breaks SGP.22: an empty result, one without its finalResult, or another command's answer.
+        for (answer in listOf(Hex.decode("BF3700"), Hex.decode("BF3203800100"),
+            Tlv.buildSeq(0xBF37, Tlv.buildSeq(0xBF27, Tlv.build(0x80, Hex.decode(tx))), Tlv.build(0x5F37, ByteArray(64))))) {
+            log.clear()
+            val (lpa, card) = connect(installResult = answer, server = provider())
+            assertEquals(Lpa.DownloadOutcome("Plan", iccid, confirmed = false), lpa.downloadProfile(code, null) { _, _ -> })
+            assertFalse("handleNotification" in log)
+            assertFalse("BF41" in log) // no cancel: the card may well have installed it
+            assertEquals(0, card.open)
+        }
+    }
+
     @Test fun aNoticeTheProviderRefusedIsNotKept() {
         val (lpa, _) = connect(server = provider(notice = { Answer(404, "") }))
         lpa.downloadProfile(code, null) { _, _ -> }
@@ -295,13 +311,48 @@ class DownloadTest {
     @Test fun aServerThatRefusedOrCantBeReachedIsNotAskedToCancel() {
         val refusal = """{"header":{"functionExecutionStatus":{"status":"Failed","statusCodeData":
             {"subjectCode":"8.2","reasonCode":"1.1"}}}}"""
-        for (fail in listOf<() -> Answer>({ ok(refusal) }, { throw IOException("offline") })) {
-            val real = provider()
-            val (lpa, _) = connect { host, call -> if (call == "getBoundProfilePackage") fail() else real(host, call) }
-            assertThrows(Exception::class.java) { lpa.downloadProfile(code, null) { _, _ -> } }
-            assertFalse("BF41" in log)
-            assertFalse("cancelSession" in log)
+        for (step in listOf("authenticateClient", "getBoundProfilePackage"))
+            for (fail in listOf<() -> Answer>({ ok(refusal) }, { throw ConnectException("offline") },
+                    { throw IOException("no route", UnknownHostException(step)) })) {
+                val real = provider()
+                val (lpa, _) = connect { host, call -> if (call == step) fail() else real(host, call) }
+                assertThrows(Exception::class.java) { lpa.downloadProfile(code, null) { _, _ -> } }
+                assertFalse(step, "BF41" in log)
+                assertFalse(step, "cancelSession" in log)
+            }
+    }
+
+    @Test fun aServerThatGotTheRequestButGaveNoClearAnswerIsAskedToCancel() {
+        // It may hold the session, and with it the order, until its own time-out: ended, it can't hold up the next try.
+        for (step in listOf("authenticateClient", "getBoundProfilePackage"))
+            for (fail in listOf<() -> Answer>({ Answer(502, "Bad gateway") }, { ok("<html>") }, { ok("{}") },
+                    { throw SocketTimeoutException("read timed out") })) {
+                val real = provider()
+                val (lpa, _) = connect { host, call -> if (call == step) fail() else real(host, call) }
+                assertThrows(Exception::class.java) { lpa.downloadProfile(code, null) { _, _ -> } }
+                assertEquals(step, listOf("BF41", "cancelSession"), log.takeLast(2))
+                // The order is kept: timeout(2), not loadBppExecutionError(5).
+                assertEquals("BF41158010${tx}810102", Hex.encode(command("BF41")))
+            }
+    }
+
+    @Test fun aHandOverIsNoFailureToCancel() {
+        val real = provider()
+        val (lpa, _) = connect { host, call ->
+            if (host == "ds.example.com" && call == "authenticateClient") events("EV-1" to "smdp.example.com") else real(host, call)
         }
+        lpa.downloadProfile(ActivationCode("ds.example.com", "FIRST"), null) { _, _ -> }
+        assertFalse("BF41" in log)
+        assertFalse("cancelSession" in log)
+    }
+
+    @Test fun aCardThatLostTrackOfTheDownloadSaysTryAgain() {
+        // AuthenticateErrorCode 6, euiccChallengeMismatch: this attempt, not the provider.
+        val refused = Hex.encode(Tlv.buildSeq(0xBF38, Tlv.buildSeq(0xA1, Tlv.build(0x80, Hex.decode(tx)), Tlv.build(0x02, byteArrayOf(6))))) + "9000"
+        val (lpa, card) = connect(server = provider())
+        card.answers["BF38"] = refused
+        assertEquals("The card lost track of this download. Try again.",
+            assertThrows(Es9Client.Es9Exception::class.java) { lpa.downloadProfile(code, null) { _, _ -> } }.message)
     }
 
     @Test fun nothingIsCancelledWhenAllGoesWellOrTheCardReportsTheFailure() {

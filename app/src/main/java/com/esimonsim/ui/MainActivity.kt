@@ -3,12 +3,9 @@ package com.esimonsim.ui
 import android.content.ClipData
 import android.content.Context
 import android.content.Intent
-import android.content.pm.verify.domain.DomainVerificationManager
-import android.content.pm.verify.domain.DomainVerificationUserState
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -35,6 +32,7 @@ import androidx.compose.material3.*
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -53,6 +51,7 @@ import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.paneTitle
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontFamily
@@ -62,12 +61,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.IntentCompat
-import androidx.core.net.toUri
-import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.esimonsim.R
-import com.esimonsim.apdu.AccessMethod
-import com.esimonsim.apdu.ShizukuStatus
 import com.esimonsim.data.ProfileStore
 import com.esimonsim.lpa.EuiccProfile
 import com.esimonsim.lpa.Lpa
@@ -79,6 +74,12 @@ import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     private val vm: LpaViewModel by viewModels()
+
+    // Android 11 and older: the Theme setting, before anything reads a resource (see ThemeSetting).
+    override fun attachBaseContext(newBase: Context) {
+        super.attachBaseContext(newBase)
+        ThemeSetting.override(newBase)?.let(::applyOverrideConfiguration)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
@@ -118,17 +119,51 @@ fun LpaScreen(vm: LpaViewModel) {
     val ready = ui.access == AccessStatus.READY
     // The install screen stays up through the download and its result, then hands back to the card.
     val installing = ready && (ui.adding || ui.installed != null)
+    // This app's Settings, over whatever pane is below. Not closed by a reconnect: it's where the way in can change
+    // while there is none.
+    var settings by rememberSaveable { mutableStateOf(false) }
+    // The Card access dialog: null closed, -1 opened in Settings, or the SIM (from 0) of a card direct access can't
+    // open. Settings opened for that card closes once card access switched: switchesAtOpen counts from then. Cancel,
+    // or the dialog opened again from Settings' own row, leaves Settings open after a switch, to see the choice change.
+    var accessDialogFor by rememberSaveable { mutableStateOf<Int?>(null) }
+    var switchesAtOpen by rememberSaveable { mutableIntStateOf(-1) }
+    val openAccess: (Int) -> Unit = { sim -> settings = true; accessDialogFor = sim; switchesAtOpen = ui.accessSwitches }
+    val closeSettings = { settings = false; accessDialogFor = null; switchesAtOpen = -1 }
+    LaunchedEffect(ui.accessSwitches) {
+        // Above the count: from before Android stopped the app, and the count started again from 0.
+        if (switchesAtOpen > ui.accessSwitches) switchesAtOpen = -1
+        else if (switchesAtOpen in 0 until ui.accessSwitches) closeSettings()
+    }
     // A fresh bar state per screen, so a checklist scrolled down doesn't leave the card screen's bar tinted.
-    val scroll = TopAppBarDefaults.pinnedScrollBehavior(key(ready, installing) { rememberTopAppBarState() })
+    val scroll = TopAppBarDefaults.pinnedScrollBehavior(key(ready, installing, settings) { rememberTopAppBarState() })
     var cardDetails by rememberSaveable { mutableStateOf(false) }
-    var stopAccess by rememberSaveable { mutableStateOf(false) }
     // Optional, with direct card access: allowing this app in Shizuku, or pairing Wireless debugging (on Android 10
-    // and older, allowing this app's debugging access), just so the app can set mobile data and roaming.
+    // and older, allowing this app's debugging access), just so the app can set mobile data and roaming. From Settings.
     var simSetup by rememberSaveable { mutableStateOf(false) }
     val draft = rememberSaveable(saver = AddDraft.Saver) { AddDraft() }
     LaunchedEffect(ui.adding) { if (!ui.adding && !ui.keepDraft) draft.clear() }
     // Card-only sheets and dialogs don't come back by themselves after a reconnect.
-    LaunchedEffect(ready) { if (!ready) { cardDetails = false; stopAccess = false; simSetup = false } }
+    LaunchedEffect(ready) { if (!ready) { cardDetails = false; simSetup = false } }
+    // A code from another app, or an Add eSIM form back after Android stopped the app, is never hidden behind Settings.
+    LaunchedEffect(installing) { if (installing) closeSettings() }
+    val pane = when {
+        ready && ui.accessSetup -> Pane.SWITCH
+        ready && simSetup -> Pane.SIM_SETTINGS
+        settings -> Pane.SETTINGS
+        !ready -> Pane.SETUP
+        installing -> Pane.ADD
+        else -> Pane.CARD
+    }
+    // Opening Settings, or a pane from it, keeps the one below as it was: half-done setup steps, a pairing under way,
+    // the card list's scroll. Any other move starts the pane left afresh next time, as ever.
+    val panes = rememberSaveableStateHolder()
+    var shown by remember { mutableStateOf(pane) }
+    LaunchedEffect(pane) {
+        if (pane != shown && pane.rank <= shown.rank) panes.removeState(shown.name)
+        shown = pane
+    }
+    // Left under Settings and over with meanwhile: setup once card access is up, the card screen once it went.
+    LaunchedEffect(ready) { panes.removeState((if (ready) Pane.SETUP else Pane.CARD).name) }
 
     // Shown from a scope that outlives the message, so the next operation clearing it doesn't cut it short.
     val scope = rememberCoroutineScope()
@@ -137,8 +172,8 @@ fun LpaScreen(vm: LpaViewModel) {
     LaunchedEffect(ui.info) {
         ui.info?.let { msg ->
             val simSettings = ui.infoSimSettings
-            // Only OMAPI's slot numbers are Android's SIM slots; the helper's are physical ones.
-            val slot = ui.slot.takeIf { ui.method == AccessMethod.DIRECT }
+            // Only OMAPI's slot numbers are Android's SIM slots; the helper's are physical ones, unless it said otherwise.
+            val slot = ui.androidSlot.takeIf { it >= 0 }
             val before = ui.subBeforeSwitch
             vm.clearInfo()
             if (simSettings) {
@@ -155,52 +190,90 @@ fun LpaScreen(vm: LpaViewModel) {
         }
     }
     // A code from another app fills in the Add eSIM form once the card has been read and is free: at once if
-    // it already is, after the "eSIM added" screen if one is up.
-    val free = ready && !ui.loading && ui.eid != null && ui.busy == null && ui.installed == null
+    // it already is, after the "eSIM added" screen if one is up. Not over a pane that sets something up: a pairing
+    // there would end.
+    val free = ready && !ui.loading && ui.eid != null && ui.busy == null && ui.installed == null && !simSetup &&
+        !ui.accessSetup
     LaunchedEffect(ui.incoming, free) {
         val code = ui.incoming
         if (code == null || !free) return@LaunchedEffect
         vm.clearIncoming()
         draft.clear(); draft.code = code
-        vm.openAdd()
+        vm.openAddFromOutside()
     }
     BackHandler(enabled = installing && ui.busy == null) { if (ui.installed != null) vm.finishInstall("", false) else vm.closeAdd() }
+    // Below the panes' own: those that set something up go back to Settings first.
+    BackHandler(enabled = settings) { closeSettings() }
 
     Scaffold(
         modifier = Modifier.nestedScroll(scroll.nestedScrollConnection),
         topBar = {
             TopAppBar(
                 title = {
+                    if (pane == Pane.SETTINGS) return@TopAppBar Text("Settings")
                     // The phone's own SIM settings go by slot, so the card's is kept in sight. Styled like
-                    // Material's app bar subtitle, which material3 1.4 keeps internal.
-                    Column {
-                        Text(if (installing) "Add eSIM" else "eSIM On-SIM")
-                        if (ready && !installing && ui.eid != null) Text("Card in SIM ${ui.slot + 1}",
-                            style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    // Material's app bar subtitle, which material3 1.4 keeps internal. With several cards it's where
+                    // to change card, also while one can't be read, as another may be the way out.
+                    val switcher = (pane == Pane.CARD || pane == Pane.ADD) && ui.installed == null && ui.switcher
+                    // Closed when the switcher goes, so it can't pop up again by itself when it's back.
+                    var open by remember(switcher) { mutableStateOf(false) }
+                    Box {
+                        Column(if (!switcher) Modifier else Modifier.heightIn(min = 48.dp).clip(MaterialTheme.shapes.small)
+                            .clickable(enabled = !ui.loading && ui.busy == null, onClickLabel = "Change card",
+                                role = Role.DropdownList) { open = true }
+                            .semantics(mergeDescendants = true) {}, verticalArrangement = Arrangement.Center) {
+                            Text(if (installing) "Add eSIM" else "eSIM On-SIM")
+                            if (switcher) Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(if ((installing && ui.pickCard) || ui.slot < 0) "Choose a card" else "Card in SIM ${ui.simNumber}",
+                                    style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Icon(painterResource(R.drawable.ic_expand_more), contentDescription = null, Modifier.size(16.dp),
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            else if (ready && !installing && ui.eid != null) Text("Card in SIM ${ui.simNumber}",
+                                style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        if (switcher) CardMenu(ui, vm, open, onLocked = openAccess) { open = false }
                     }
                 },
                 navigationIcon = {
-                    // Disabled, not hidden, while busy: removing it shifted the title sideways.
-                    if (installing) IconButton(onClick = {
-                        if (ui.installed != null) vm.finishInstall("", false) else vm.closeAdd()
-                    }, enabled = ui.busy == null) { Icon(painterResource(R.drawable.ic_close), contentDescription = "Close") }
-                    else if (ready && simSetup) IconButton(onClick = { vm.cancelPairing(); simSetup = false }) {
-                        Icon(painterResource(R.drawable.ic_close), contentDescription = "Close")
+                    when (pane) {
+                        // Disabled, not hidden, while busy: removing it shifted the title sideways.
+                        Pane.ADD -> IconButton(onClick = {
+                            if (ui.installed != null) vm.finishInstall("", false) else vm.closeAdd()
+                        }, enabled = ui.busy == null) { Icon(painterResource(R.drawable.ic_close), contentDescription = "Close") }
+                        // Card access carries on as it is.
+                        Pane.SWITCH -> IconButton(onClick = vm::closeAccessSetup) {
+                            Icon(painterResource(R.drawable.ic_close), contentDescription = "Close")
+                        }
+                        Pane.SIM_SETTINGS -> IconButton(onClick = { vm.cancelPairing(); simSetup = false }) {
+                            Icon(painterResource(R.drawable.ic_close), contentDescription = "Close")
+                        }
+                        Pane.SETTINGS -> IconButton(onClick = closeSettings) {
+                            Icon(painterResource(R.drawable.ic_arrow_back), contentDescription = "Back")
+                        }
+                        else -> {}
                     }
                 },
                 scrollBehavior = scroll,
                 actions = {
                     val onAbout = { AboutActivity.open(context, ui) }
-                    if (ready && !installing && !simSetup) CardActions(enabled = !ui.loading && ui.busy == null,
-                        cardRead = ui.eid != null, onRefresh = vm::loadCard, onDetails = { cardDetails = true },
-                        onStop = { stopAccess = true }, onAbout = onAbout)
-                    // Setup and reconnecting: what the app is, before setting anything up.
-                    else if (!ready) MoreMenu { close -> DropdownMenuItem(text = { Text("About") }, onClick = { close(); onAbout() }) }
+                    val onSettings = { settings = true }
+                    when (pane) {
+                        Pane.CARD -> CardActions(enabled = !ui.loading && ui.busy == null, cardRead = ui.eid != null,
+                            onRefresh = vm::loadCard, onSettings = onSettings, onDetails = { cardDetails = true },
+                            onAbout = onAbout)
+                        // Setup and reconnecting: how to reach the card, and what the app is, before setting anything up.
+                        Pane.SETUP -> MoreMenu { close ->
+                            DropdownMenuItem(text = { Text("Settings") }, onClick = { close(); onSettings() })
+                            DropdownMenuItem(text = { Text("About") }, onClick = { close(); onAbout() })
+                        }
+                        else -> {}
+                    }
                 },
             )
         },
         floatingActionButton = {
-            if (ready && !installing && !simSetup && ui.eid != null && ui.profiles.isNotEmpty()) ExtendedFloatingActionButton(
+            if (pane == Pane.CARD && ui.eid != null && ui.profiles.isNotEmpty()) ExtendedFloatingActionButton(
                 onClick = vm::openAdd,
                 icon = { Icon(painterResource(R.drawable.ic_add), contentDescription = null) },
                 text = { Text("Add eSIM") },
@@ -211,16 +284,26 @@ fun LpaScreen(vm: LpaViewModel) {
         },
         snackbarHost = { SnackbarHost(snackbar) },
     ) { pad ->
-        when {
-            // Panes, each on its own screen's root: the screens swap inside one window, and a new pane is what a screen
-            // reader announces. Not on anything above that stays through the swap, and never nested.
-            !ready -> SetupScreen(ui, vm, Modifier.padding(pad).consumeWindowInsets(pad).semantics {
-                paneTitle = if (ui.access == AccessStatus.CONNECTING) "Connecting to your card" else "Card access"
-            })
-            simSetup -> SimSettingsSetup(ui, vm, Modifier.padding(pad).consumeWindowInsets(pad)
-                .semantics { paneTitle = "Mobile data and roaming" }) { simSetup = false }
-            installing -> AddScreen(ui, vm, draft, pad)
-            else -> CardScreen(ui, vm, pad)
+        val inset = Modifier.padding(pad).consumeWindowInsets(pad)
+        // Panes, each on its own screen's root: the screens swap inside one window, and a new pane is what a screen
+        // reader announces. Not on anything above that stays through the swap, and never nested.
+        panes.SaveableStateProvider(pane.name) {
+            when (pane) {
+                Pane.SWITCH -> SimSettingsSetup(ui, vm, inset.semantics {
+                    paneTitle = if (Build.VERSION.SDK_INT >= 30) "Set up Wireless debugging" else "Set up USB debugging"
+                }, SetupFor.SWITCH, onDone = vm::closeAccessSetup)
+                Pane.SIM_SETTINGS -> SimSettingsSetup(ui, vm, inset.semantics { paneTitle = "Mobile data and roaming" },
+                    SetupFor.SIM_SETTINGS) { simSetup = false }
+                Pane.SETTINGS -> SettingsScreen(ui, vm, inset.semantics { paneTitle = "Settings" }, accessDialogFor,
+                    onAccessDialog = { if (it == -1) switchesAtOpen = -1; accessDialogFor = it },
+                    onAccessCancel = { accessDialogFor = null; switchesAtOpen = -1 }, onSimSetup = { simSetup = true },
+                    onClose = closeSettings)
+                Pane.SETUP -> SetupScreen(ui, vm, inset.semantics {
+                    paneTitle = if (ui.access == AccessStatus.CONNECTING) "Connecting to your card" else "Card access"
+                })
+                Pane.ADD -> AddScreen(ui, vm, draft, pad)
+                Pane.CARD -> CardScreen(ui, vm, pad, onCardAccess = openAccess)
+            }
         }
     }
 
@@ -236,9 +319,7 @@ fun LpaScreen(vm: LpaViewModel) {
                 SnackbarResult.ActionPerformed) vm.setHidden(p, false)
         }
     })
-    if (ready && cardDetails && ui.eid != null) CardDetailsSheet(ui, onShown = vm::loadCardInfo, onDismiss = { cardDetails = false },
-        onStop = { cardDetails = false; stopAccess = true }, onSimSetup = { cardDetails = false; simSetup = true })
-    if (ready && stopAccess) StopAccessDialog(ui, onDismiss = { stopAccess = false }, onStop = { stopAccess = false; vm.disconnect() })
+    if (ready && cardDetails && ui.eid != null) CardDetailsSheet(ui, onShown = vm::loadCardInfo, onDismiss = { cardDetails = false })
     if (ready) ui.duplicate?.let { DuplicateDialog(it, vm) }
     val errorTitle = ui.errorTitle
     val error = ui.error
@@ -247,16 +328,21 @@ fun LpaScreen(vm: LpaViewModel) {
     ui.busy?.let { if (!installing || it.step == null) BusyDialog(it, onCancel = vm::cancelBusy) }
 }
 
+/** The screens [LpaScreen] swaps between. What opens from Settings shows over it, and it over the rest: going up a
+ *  [rank] keeps the pane below as it was, for coming back to. */
+private enum class Pane(val rank: Int) { SWITCH(2), SIM_SETTINGS(2), SETTINGS(1), SETUP(0), ADD(0), CARD(0) }
+
 @Composable
-private fun CardActions(enabled: Boolean, cardRead: Boolean, onRefresh: () -> Unit, onDetails: () -> Unit,
-                        onStop: () -> Unit, onAbout: () -> Unit) {
+private fun CardActions(enabled: Boolean, cardRead: Boolean, onRefresh: () -> Unit, onSettings: () -> Unit,
+                        onDetails: () -> Unit, onAbout: () -> Unit) {
     IconButton(onClick = onRefresh, enabled = enabled) {
         Icon(painterResource(R.drawable.ic_refresh), contentDescription = "Refresh")
     }
     MoreMenu { close ->
-        // Also while the card is busy, unlike the others, but it's nothing until the card has been read.
+        // Settings and Details also while the card is busy, unlike Refresh: Settings disables what can't change then,
+        // and Details is nothing until the card has been read.
+        DropdownMenuItem(text = { Text("Settings") }, onClick = { close(); onSettings() })
         DropdownMenuItem(text = { Text("Details") }, enabled = cardRead, onClick = { close(); onDetails() })
-        DropdownMenuItem(text = { Text("Stop card access") }, enabled = enabled, onClick = { close(); onStop() })
         DropdownMenuItem(text = { Text("About") }, onClick = { close(); onAbout() })
     }
 }
@@ -273,15 +359,17 @@ private fun MoreMenu(items: @Composable ColumnScope.(close: () -> Unit) -> Unit)
     }
 }
 
+/** [onCardAccess]: opens Card access in Settings for the card in that SIM (from 0), which direct access can't open. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun CardScreen(ui: LpaUi, vm: LpaViewModel, pad: PaddingValues) {
+private fun CardScreen(ui: LpaUi, vm: LpaViewModel, pad: PaddingValues, onCardAccess: (Int) -> Unit) {
     if (ui.eid == null) {
         Box(Modifier.padding(pad)) {
             when {
                 ui.loading -> Loading()
-                ui.builtInChip != null -> BuiltInChip(onRetry = vm::loadCard, onMine = vm::ownCard)
-                else -> LoadFailed(ui.error, vm::loadCard)
+                ui.builtInChip != null -> BuiltInChip(idle = ui.idleSlot >= 0, onRetry = vm::loadCard, onMine = vm::ownCard)
+                else -> LoadFailed(ui.error, vm::loadCard,
+                    Lpa.lockedSim(ui.error)?.let { sim -> { onCardAccess(sim - 1) } })
             }
         }
         return
@@ -321,7 +409,8 @@ private fun CardScreen(ui: LpaUi, vm: LpaViewModel, pad: PaddingValues) {
     // landscape, where 3-button navigation sits at the edge.
     PullToRefreshBox(isRefreshing = ui.loading, onRefresh = vm::loadCard,
         modifier = Modifier.fillMaxSize().padding(start = pad.calculateStartPadding(dir),
-            top = pad.calculateTopPadding(), end = pad.calculateEndPadding(dir)).semantics { paneTitle = "Your eSIMs" }) {
+            top = pad.calculateTopPadding(), end = pad.calculateEndPadding(dir))
+            .semantics { paneTitle = if (ui.switcher) "Your eSIMs, SIM ${ui.simNumber}" else "Your eSIMs" }) {
         LazyColumn(
             Modifier.fillMaxSize(),
             state = list,
@@ -555,8 +644,9 @@ private fun Loading() {
     }
 }
 
+/** [onCardAccess]: the only eSIM card found doesn't let direct access in, so another way in is what helps. */
 @Composable
-private fun LoadFailed(error: String?, onRetry: () -> Unit) {
+private fun LoadFailed(error: String?, onRetry: () -> Unit, onCardAccess: (() -> Unit)?) {
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(Modifier.verticalScroll(rememberScrollState()).padding(32.dp),
             horizontalAlignment = Alignment.CenterHorizontally) {
@@ -571,13 +661,17 @@ private fun LoadFailed(error: String?, onRetry: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(24.dp))
             Button(onClick = onRetry) { Text("Try again") }
+            onCardAccess?.let { TextButton(onClick = it) { Text("Change card access") } }
         }
     }
 }
 
-/** Only the phone's own chip answered, so nothing on it shows: to this app it would look like the user's card. */
+/** Only the phone's own chip answered, so nothing on it shows: to this app it would look like the user's card. [idle]:
+ *  the phone isn't using a slot with another eSIM card in it, which is likely the removable one. Then saying this chip is
+ *  it would be a mistake that hands Android's own eSIMs to this app, so that's not offered. */
 @Composable
-private fun BuiltInChip(onRetry: () -> Unit, onMine: () -> Unit) {
+private fun BuiltInChip(idle: Boolean, onRetry: () -> Unit, onMine: () -> Unit) {
+    val context = LocalContext.current
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(Modifier.verticalScroll(rememberScrollState()).padding(32.dp),
             horizontalAlignment = Alignment.CenterHorizontally) {
@@ -587,164 +681,100 @@ private fun BuiltInChip(onRetry: () -> Unit, onMine: () -> Unit) {
             Text("This looks like your phone's own eSIM", style = MaterialTheme.typography.headlineSmall,
                 textAlign = TextAlign.Center, modifier = Modifier.semantics { heading() })
             Spacer(Modifier.height(8.dp))
-            Text("The only eSIM chip found may be the one built into this phone, not a removable card. Manage that one in " +
+            Text(if (idle) "The only eSIM chip this app can open may be the one built into this phone. Your phone isn't " +
+                "using another SIM slot that has an eSIM card in it, which may be your removable card. Turn that SIM on in " +
+                "your phone's SIM settings, then try again."
+                else "The only eSIM chip found may be the one built into this phone, not a removable card. Manage that one in " +
                 "your phone's Settings. If you have a removable eSIM card, check that it's in the SIM tray, then try again.",
                 style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(24.dp))
-            Button(onClick = onRetry) { Text("Try again") }
-            TextButton(onClick = onMine) { Text("It's my removable card") }
+            if (idle) {
+                Button(onClick = { openSimSettings(context, null, -1) }) { Text("SIM settings") }
+                TextButton(onClick = onRetry) { Text("Try again") }
+            } else {
+                Button(onClick = onRetry) { Text("Try again") }
+                TextButton(onClick = onMine) { Text("It's my removable card") }
+            }
         }
     }
 }
 
-/** The technical details, out of the main view: the card's own (EID, slot, free space, versions), then how this
- *  phone reaches it and what's set up for the app here (card access, pairing, eSIM links). */
+/** The cards in the phone, for the switcher: the one in view checked, unless the Add eSIM form waits for a pick. One the
+ *  phone isn't using leads to SIM settings, as this app can't open it there. One that direct access can't open leads
+ *  to [onLocked], with its SIM (from 0): another way in opens it. Under the Add eSIM form there's none ([LpaUi.menuRows]). */
+@Composable
+fun CardMenu(ui: LpaUi, vm: LpaViewModel, open: Boolean, onLocked: (sim: Int) -> Unit = {}, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    DropdownMenu(expanded = open, onDismissRequest = onDismiss) {
+        ui.menuRows.forEach { row ->
+            val current = row.eid != null && row.slot == ui.slot && !(ui.adding && ui.pickCard)
+            DropdownMenuItem(
+                text = {
+                    Column {
+                        Text(row.title, style = MaterialTheme.typography.bodyLarge)
+                        row.note?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    }
+                },
+                leadingIcon = {
+                    Icon(painterResource(if (current) R.drawable.ic_check_circle else R.drawable.ic_sim), contentDescription = null,
+                        tint = if (current) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
+                },
+                onClick = {
+                    onDismiss()
+                    when {
+                        row.locked -> onLocked(row.sim)
+                        row.eid != null -> vm.selectCard(row.eid)
+                        // A slot the phone isn't using has no SIM page: the list of SIMs, where it can be turned on.
+                        else -> openSimSettings(context, null, -1)
+                    }
+                },
+                modifier = Modifier.semantics { selected = current },
+            )
+        }
+    }
+}
+
+/** The card's own details, out of the main view: EID, slot, free space, versions. What's set up for the app on this
+ *  phone is in Settings, so nothing shows in both. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun CardDetailsSheet(ui: LpaUi, onShown: () -> Unit, onDismiss: () -> Unit, onStop: () -> Unit,
-                             onSimSetup: () -> Unit) {
+private fun CardDetailsSheet(ui: LpaUi, onShown: () -> Unit, onDismiss: () -> Unit) {
     val eid = ui.eid ?: return
-    val context = LocalContext.current
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         LaunchedEffect(Unit) { onShown() }
         Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 24.dp).padding(bottom = 24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)) {
             Text("Details", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.semantics { heading() })
-            DetailsSection("Card") {
-                EidCard(eid, "Your eSIM card's own ID number. Some providers ask for it.")
-                InfoCard {
-                    InfoRow("SIM slot", "SIM ${ui.slot + 1}", "Most eSIMs need data roaming on for this SIM to work.")
+            EidCard(eid, "Your eSIM card's own ID number. Some providers ask for it.")
+            InfoCard {
+                InfoRow("SIM slot", "SIM ${ui.simNumber}", "Most eSIMs need data roaming on for this SIM to work.")
+                InfoDivider()
+                val hidden = ui.profiles.count { !it.enabled && it.iccid in ui.hidden }
+                InfoRow("eSIMs on the card", "${ui.profiles.size}" + if (hidden > 0) " ($hidden hidden)" else "")
+                InfoDivider()
+                val info = ui.cardInfo
+                fun reported(value: String?) = value ?: if (ui.cardInfoLoading) "Checking…" else "Not reported"
+                InfoRow("Free space", reported(info?.freeBytes?.let(::formatBytes)), "Room left on the card for new eSIMs.")
+                InfoDivider()
+                InfoRow("eSIM standard", reported(info?.standard?.let { "SGP.22 v$it" }))
+                InfoDivider()
+                InfoRow("Firmware", reported(info?.firmware))
+                InfoDivider()
+                InfoRow("Certificates", reported(info?.rootNames?.takeIf { it.isNotEmpty() }?.joinToString(", ")),
+                    "The card only installs eSIMs from providers certified under these. Mainstream providers use GSMA.")
+                InfoDivider()
+                InfoRow("Discovery server", reported(info?.rootDs), if (info?.rootDs?.let(Lpa::isTestServer) == true)
+                    "The GSMA's test server, set by the card's maker. Real eSIMs are never sent there, so \"Check for " +
+                        "eSIMs sent to this card (SM-DS)\" on the Add eSIM screen asks the GSMA's and Google's instead."
+                    else "Where providers can leave an eSIM for this card's EID. \"Check for eSIMs sent to this card (SM-DS)\" " +
+                        "on the Add eSIM screen also asks the GSMA's and Google's.")
+                info?.defaultDp?.let {
                     InfoDivider()
-                    val hidden = ui.profiles.count { !it.enabled && it.iccid in ui.hidden }
-                    InfoRow("eSIMs on the card", "${ui.profiles.size}" + if (hidden > 0) " ($hidden hidden)" else "")
-                    InfoDivider()
-                    val info = ui.cardInfo
-                    fun reported(value: String?) = value ?: if (ui.cardInfoLoading) "Checking…" else "Not reported"
-                    InfoRow("Free space", reported(info?.freeBytes?.let(::formatBytes)), "Room left on the card for new eSIMs.")
-                    InfoDivider()
-                    InfoRow("eSIM standard", reported(info?.standard?.let { "SGP.22 v$it" }))
-                    InfoDivider()
-                    InfoRow("Firmware", reported(info?.firmware))
-                    InfoDivider()
-                    InfoRow("Certificates", reported(info?.rootNames?.takeIf { it.isNotEmpty() }?.joinToString(", ")),
-                        "The card only installs eSIMs from providers certified under these. Mainstream providers use GSMA.")
-                    InfoDivider()
-                    InfoRow("Discovery server", reported(info?.rootDs), if (info?.rootDs?.let(Lpa::isTestServer) == true)
-                        "The GSMA's test server, set by the card's maker. Real eSIMs are never sent there, so \"Check for " +
-                            "eSIMs sent to this card (SM-DS)\" on the Add eSIM screen asks the GSMA's and Google's instead."
-                        else "Where providers can leave an eSIM for this card's EID. \"Check for eSIMs sent to this card (SM-DS)\" " +
-                            "on the Add eSIM screen also asks the GSMA's and Google's.")
-                    info?.defaultDp?.let {
-                        InfoDivider()
-                        InfoRow("Default provider", it, "Set on the card by its maker. \"Check for eSIMs sent to this " +
-                            "card\" on the Add eSIM screen lists it, in case it has one for you.")
-                    }
+                    InfoRow("Default provider", it, "Set on the card by its maker. \"Check for eSIMs sent to this " +
+                        "card\" on the Add eSIM screen lists it, in case it has one for you.")
                 }
             }
-            // How this phone reaches the card, and what's set up for the app here: none of it moves with the card.
-            DetailsSection("On this phone") {
-                InfoCard {
-                    val adb = ui.method == AccessMethod.ADB
-                    // Android 10 and older: no Wireless debugging. A computer turned on Android's debugging port, which
-                    // lasts until the phone restarts, and needs USB debugging on to listen.
-                    val legacy = Build.VERSION.SDK_INT < 30
-                    when {
-                        ui.method == AccessMethod.DIRECT -> InfoRow("Card access", "Direct",
-                            "Your card lets this app manage it, so nothing needs setting up.")
-                        ui.method == AccessMethod.ROOT -> InfoRow("Card access", "Root",
-                            "Works without Wi-Fi or Wireless debugging. This app's helper ends when you swipe the app " +
-                                "away from Recent apps or tap \"Stop card access\" below.")
-                        ui.method == AccessMethod.SHIZUKU -> InfoRow("Card access", "Shizuku",
-                            "Works while Shizuku is running. This app's helper ends when you swipe the app away from " +
-                                "Recent apps or tap \"Stop card access\" below." +
-                                // Only a Shizuku started with root leaves Android's debugging service behind.
-                                if (ui.settings.usbDebugging == true) "" else " If you started Shizuku with Wireless " +
-                                    "debugging, Android can stop it when Wi-Fi drops. Turning on \"USB debugging\" in " +
-                                    "Developer options may help, but some banking apps won't open while it's on.")
-                        legacy && !ui.background -> InfoRow("Card access", "USB debugging",
-                            "Set up with a computer. Works while USB debugging is on, until your phone restarts. After a " +
-                                "restart, it needs the computer again.")
-                        // Android 7.1 and older leave the helper running when their debugging service stops.
-                        legacy && Build.VERSION.SDK_INT < 26 -> InfoRow("Card access", "Background helper",
-                            "Set up with a computer. Usually keeps working until your phone restarts, even with USB " +
-                                "debugging off. After a restart, it needs the computer again.")
-                        legacy -> InfoRow("Card access", "Background helper",
-                            "Set up with a computer. Keeps working while USB debugging is on, until your phone restarts. " +
-                                "After a restart, it needs the computer again.")
-                        // Started where the background helper can't run: requests go over Wireless debugging itself.
-                        !ui.background -> InfoRow("Card access", "Wireless debugging", "Works while Wireless debugging is on.")
-                        ui.settings.usbDebugging == true -> InfoRow("Card access", "Background helper",
-                            "Keeps working without Wi-Fi until your phone restarts or this app is updated.")
-                        // Android 17 may not tell apps whether USB debugging is on.
-                        ui.settings.usbDebugging == null -> InfoRow("Card access", "Background helper",
-                            "Keeps working without Wi-Fi until your phone restarts or this app is updated, as long as " +
-                                "\"USB debugging\" is on in Developer options. Without it, it stops when Wireless debugging " +
-                                "goes off.") { openDeveloperOptions(context) }
-                        // Android stops its debugging service, and the helper with it, once both kinds are off.
-                        else -> InfoRow("Card access", "Background helper", "Stops when Wireless debugging goes off, " +
-                            "which Android also does when Wi-Fi drops or changes. Turn on \"USB debugging\" in Developer " +
-                            "options to keep it working without Wi-Fi until your phone restarts or this app is updated. " +
-                            "Some banking apps won't open while it's on.") { openDeveloperOptions(context) }
-                    }
-                    // Android keeps these from apps; with direct access, Shizuku or a pairing just for them is optional.
-                    if (ui.method == AccessMethod.DIRECT) {
-                        InfoDivider()
-                        when {
-                            // Tried first by a switch, and asks nobody anything.
-                            ui.shizuku == ShizukuStatus.ALLOWED -> InfoRow("Mobile data and roaming", "Shizuku",
-                                "After a switch, the app sets the ones you tick while Shizuku is running.")
-                            // A switch found that the phone forgot this app (Android 10 after 7 days unused, say).
-                            ui.paired && legacy && ui.simAllowNeeded -> InfoRow("Mobile data and roaming", "Allow again",
-                                "Your phone no longer allows this app's debugging access, so a switch can't set these. " +
-                                    "Tap to allow it again.", onSimSetup)
-                            // Its steps stay at hand: after a restart, they're needed again.
-                            ui.paired && legacy -> InfoRow("Mobile data and roaming", "USB debugging",
-                                "After a switch, the app sets the ones you tick, while USB debugging is on. After a " +
-                                    "restart, that needs the computer again: tap for the steps.", onSimSetup)
-                            // Shizuku needs no Wireless debugging: its setup is open to those who have it.
-                            ui.paired -> InfoRow("Mobile data and roaming", "Wireless debugging",
-                                "After a switch, the app sets the ones you tick while Wireless debugging is on." +
-                                    if (ui.shizuku != ShizukuStatus.ABSENT) " Tap to use Shizuku instead." else "",
-                                onSimSetup.takeIf { ui.shizuku != ShizukuStatus.ABSENT })
-                            else -> InfoRow("Mobile data and roaming", "Set up", "Optional. Android only lets this app " +
-                                "change them through " + (if (legacy) "its debugging tool, set up with a computer"
-                                    else "Wireless debugging") + (if (ui.shizuku != ShizukuStatus.ABSENT) " or Shizuku" else "") +
-                                    (if (ui.rootFound) " or root" else "") + ". " +
-                                "Otherwise, a switch offers your phone's SIM settings.", onSimSetup)
-                        }
-                    }
-                    // Card access only uses the pairing to start its helper, so it can go unused for a week easily.
-                    if (adb || (ui.method == AccessMethod.DIRECT && ui.paired)) {
-                        InfoDivider()
-                        when {
-                            // Android 10 forgets allowed keys after a week too, and has no switch to stop it. With direct
-                            // access the app connects only for a switch, and then without asking.
-                            legacy && ui.settings.pairingExpires -> InfoRow("Allowed", "Expires after 7 days unused",
-                                if (adb) "Then your phone asks \"Allow USB debugging?\" again the next time this app connects."
-                                    else "Then allow this app again from \"Mobile data and roaming\" above.")
-                            legacy -> InfoRow("Allowed", "Kept", "Your phone remembers this app until you tap \"Revoke " +
-                                "USB debugging authorizations\" in Developer options.")
-                            ui.settings.pairingExpires -> InfoRow("Pairing", "Expires after 7 days unused",
-                                "Then the app needs pairing again the next time it starts its helper, e.g. after a restart. " +
-                                    "To keep it, turn on \"Disable adb authorization timeout\" in Developer options.") {
-                                openDeveloperOptions(context)
-                            }
-                            else -> InfoRow("Pairing", "Kept", "Android keeps this app's pairing until you remove it.")
-                        }
-                    }
-                    // Unverified links open in the browser until people allow them for an app (Android 12+).
-                    if (Build.VERSION.SDK_INT >= 31) {
-                        InfoDivider()
-                        val on = rememberLinksAllowed()
-                        InfoRow("eSIM links", if (on) "On" else "Set up",
-                            if (on) "\"Install on iPhone\" links from eSIM shops open in this app."
-                            else "Opens \"Install on iPhone\" links from eSIM shops in this app: tap, then add " +
-                                "esimsetup.apple.com under \"Add link\".") { openLinkSettings(context) }
-                    }
-                }
-            }
-            OutlinedButton(onClick = onStop, modifier = Modifier.fillMaxWidth()) { Text("Stop card access") }
         }
     }
 }
@@ -753,7 +783,7 @@ private fun CardDetailsSheet(ui: LpaUi, onShown: () -> Unit, onDismiss: () -> Un
  *  line of help below. A flow, not a Row: a long value, like the card's certificate list, would otherwise
  *  squeeze the label to nothing. With [onClick], the whole row is a button. */
 @Composable
-private fun InfoRow(label: String, value: String, help: String? = null, onClick: (() -> Unit)? = null) {
+internal fun InfoRow(label: String, value: String, help: String? = null, onClick: (() -> Unit)? = null) {
     Column(Modifier.fillMaxWidth().then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
             .padding(horizontal = 16.dp, vertical = 12.dp).semantics(mergeDescendants = true) {}) {
         FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -768,11 +798,11 @@ private fun InfoRow(label: String, value: String, help: String? = null, onClick:
     }
 }
 
-@Composable private fun InfoDivider() = HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+@Composable internal fun InfoDivider() = HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
 
-/** A labelled group on the Details sheet. */
+/** A labelled group of [InfoCard]s, as in Settings. */
 @Composable
-private fun DetailsSection(title: String, content: @Composable ColumnScope.() -> Unit) {
+internal fun DetailsSection(title: String, content: @Composable ColumnScope.() -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text(title, style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(start = 4.dp).semantics { heading() })
@@ -782,32 +812,8 @@ private fun DetailsSection(title: String, content: @Composable ColumnScope.() ->
 
 /** [InfoRow]s in one card, divided by [InfoDivider]s. */
 @Composable
-private fun InfoCard(content: @Composable ColumnScope.() -> Unit) =
+internal fun InfoCard(content: @Composable ColumnScope.() -> Unit) =
     OutlinedCard(Modifier.fillMaxWidth(), colors = CardDefaults.outlinedCardColors(containerColor = cardColor()), content = content)
-
-/** Whether people let this app open "Install on iPhone" links; read again each time the app comes back. */
-@androidx.annotation.RequiresApi(31)
-@Composable
-private fun rememberLinksAllowed(): Boolean {
-    val context = LocalContext.current
-    var on by remember { mutableStateOf(false) }
-    LifecycleResumeEffect(Unit) {
-        on = runCatching {
-            context.getSystemService(DomainVerificationManager::class.java)
-                ?.getDomainVerificationUserState(context.packageName)?.hostToStateMap?.get("esimsetup.apple.com") ==
-                DomainVerificationUserState.DOMAIN_STATE_SELECTED
-        }.getOrDefault(false)
-        onPauseOrDispose {}
-    }
-    return on
-}
-
-/** This app's "Open by default" page, where people allow links it can't verify. */
-@androidx.annotation.RequiresApi(31)
-private fun openLinkSettings(context: Context) {
-    runCatching { context.startActivity(Intent(Settings.ACTION_APP_OPEN_BY_DEFAULT_SETTINGS,
-        "package:${context.packageName}".toUri())) }
-}
 
 private fun formatBytes(bytes: Long) =
     if (bytes >= 1024 * 1024) String.format(java.util.Locale.getDefault(), "%.1f MB", bytes / (1024.0 * 1024))
@@ -847,33 +853,6 @@ fun EidCard(eid: String, help: String) {
     }
 }
 
-private const val STOPS_HELPER = " and stops its background helper, the small program that keeps it connected"
-
-@Composable
-private fun StopAccessDialog(ui: LpaUi, onDismiss: () -> Unit, onStop: () -> Unit) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Stop card access?") },
-        text = { Text(when {
-            ui.method == AccessMethod.DIRECT || ui.method == AccessMethod.ROOT || ui.method == AccessMethod.SHIZUKU ->
-                "The app disconnects from your card until you reconnect."
-            // Android 10 and older: the debugging port stays on until a restart, so reconnecting needs no computer.
-            Build.VERSION.SDK_INT < 30 -> "The app disconnects from your card" + (if (ui.background) STOPS_HELPER else "") +
-                ". You can reconnect without the computer until your phone restarts, which also turns off what this " +
-                "app connects to."
-            // Running without Wireless debugging (no Wi-Fi, say): starting again needs it, and so Wi-Fi.
-            ui.background && ui.settings.wirelessDebugging != true -> "The app disconnects from your card$STOPS_HELPER. " +
-                "To connect again, you'll need Wi-Fi and Wireless debugging."
-            ui.background -> "The app disconnects from your card$STOPS_HELPER. Wireless debugging stays on until you " +
-                "turn it off or restart your phone."
-            else -> "The app disconnects from your card. Wireless debugging stays on until you turn it off or " +
-                "restart your phone."
-        }, Modifier.verticalScroll(rememberScrollState())) },
-        confirmButton = { TextButton(onClick = onStop) { Text("Stop") } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-    )
-}
-
 enum class Action { SWITCH, TURN_OFF, DELETE }
 
 data class Confirm(val action: Action, val profile: EuiccProfile) {
@@ -885,15 +864,24 @@ data class Confirm(val action: Action, val profile: EuiccProfile) {
     }
 }
 
-fun switchNote(active: EuiccProfile?) =
-    (active?.let { "${it.displayName} will be turned off. " } ?: "") +
-        "The card restarts, so your phone may have no signal for up to a minute."
+/** Some phones stop seeing a card with no eSIM on, and then only another phone can turn one on again. With [others] on
+ *  the card, switching to one is the way that never leaves it with none. */
+fun turnOffNote(others: Boolean) = (if (others) "To use another eSIM on this card, tap Use next to it instead: that " +
+    "turns this one off for you.\n\n" else "") + "With no eSIM on, you'll have no service from this card. Some phones " +
+    "also stop seeing the card until an eSIM is turned on in another phone."
 
-/** What the phone does once the eSIM is on. Checked items are changed; unchecked ones are left as they are. */
+/** With [sim], the card's SIM number when there are several: the other card's SIM keeps its signal. */
+fun switchNote(active: EuiccProfile?, sim: Int? = null) =
+    (active?.let { "${it.displayName} will be turned off. " } ?: "") +
+        "The card restarts, so ${sim?.let { "SIM $it" } ?: "your phone"} may have no signal for up to a minute."
+
+/** What the phone does once the eSIM is on. Checked items are changed; unchecked ones are left as they are.
+ *  [dataElsewhere]: another SIM has mobile data, which Android turns off there when this one takes it. */
 @Composable
-fun SwitchOptions(setup: ProfileStore.SwitchSetup, onChange: (ProfileStore.SwitchSetup) -> Unit) {
+fun SwitchOptions(setup: ProfileStore.SwitchSetup, dataElsewhere: Boolean = false, onChange: (ProfileStore.SwitchSetup) -> Unit) {
     Column {
-        CheckRow("Use for mobile data", "Makes it your mobile data SIM and turns mobile data on.", setup.mobileData) {
+        CheckRow("Use for mobile data", if (dataElsewhere) "Moves mobile data from your other SIM and turns it off there."
+            else "Makes it your mobile data SIM and turns mobile data on.", setup.mobileData) {
             onChange(setup.copy(mobileData = it))
         }
         CheckRow("Turn on data roaming", "Travel eSIMs usually need it. Your home SIM may charge for roaming abroad.",
@@ -925,12 +913,16 @@ fun ConfirmDialog(c: Confirm, ui: LpaUi, onDismiss: () -> Unit, onHide: (() -> U
     val name = c.profile.displayName
     val active = ui.profiles.firstOrNull { it.enabled }
     val hide = onHide.takeIf { c.action == Action.DELETE }
-    var setup by remember { mutableStateOf(ui.switchSetup) }
+    val context = LocalContext.current
+    // With several cards, mobile data starts ticked where it is now, or with no SIM having it: a choice remembered from
+    // the other card would take it from there.
+    val elsewhere = remember { if (ui.manageable >= 2) dataElsewhere(context, ui.androidSlot) else null }
+    var setup by remember { mutableStateOf(elsewhere?.let { ui.switchSetup.copy(mobileData = !it) } ?: ui.switchSetup) }
     val (title, body, button) = when (c.action) {
-        Action.SWITCH -> Triple(if (active == null) "Turn on $name?" else "Switch to $name?", switchNote(active),
+        Action.SWITCH -> Triple(if (active == null) "Turn on $name?" else "Switch to $name?",
+            switchNote(active, ui.simNumber.takeIf { ui.manageable >= 2 }),
             if (active == null) "Turn on" else "Switch")
-        Action.TURN_OFF -> Triple("Turn off $name?",
-            "You'll have no service from this card until you turn on this eSIM or another one.", "Turn off")
+        Action.TURN_OFF -> Triple("Turn off $name?", turnOffNote(others = ui.profiles.size > 1), "Turn off")
         Action.DELETE -> Triple("Delete $name?",
             "This permanently removes it from the card. Most eSIMs can be downloaded only once, so the same QR " +
                 "code probably won't work again, and you'd lose any data or credit left on it." +
@@ -947,7 +939,7 @@ fun ConfirmDialog(c: Confirm, ui: LpaUi, onDismiss: () -> Unit, onHide: (() -> U
                 // Only where the app can change SIM settings: Android keeps them from ordinary apps.
                 if (c.action == Action.SWITCH && ui.canSetUpSim) {
                     Spacer(Modifier.height(16.dp))
-                    SwitchOptions(setup) { setup = it }
+                    SwitchOptions(setup, dataElsewhere = elsewhere == true) { setup = it }
                 }
             }
         },

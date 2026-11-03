@@ -1,3 +1,11 @@
+## What's new
+
+- **Two eSIM cards:** with both in your phone, switch between them at the top of the app.
+- **Settings:** choose how the app reaches your card, and pick a light or dark look.
+- **Safer installs:** the app double-checks with your card that a new eSIM really went on.
+- **Clearer messages** when a provider or your card says no, so you know whether to try again.
+- **Licences** for the parts the app is built on, under About.
+
 ## Download
 
 On your Android phone, tap the one that fits. Both are the same app, and you can ignore the other files below.

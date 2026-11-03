@@ -86,6 +86,8 @@ fun AppTheme(content: @Composable () -> Unit) {
     // The app is English only, so left to right on any phone: on a right-to-left phone the EID's and ICCID's groups of
     // digits would show in reverse order, and people type those into shops. Translating it would mean undoing this.
     CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+        // isSystemInDarkTheme follows the Theme setting too: Android 12+ apply it to the whole app, older versions to
+        // the activity's configuration (see ThemeSetting).
         MaterialTheme(colorScheme = if (isSystemInDarkTheme()) Dark else Light, typography = Type, content = content)
     }
 }

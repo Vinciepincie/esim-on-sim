@@ -12,11 +12,13 @@ import java.io.PipedInputStream
 import java.io.PipedOutputStream
 import java.util.NoSuchElementException
 
-/** What a fake SIM reader holds. */
-enum class FakeCard { OPEN, LOCKED, ORDINARY }
+/** What a fake SIM reader holds. LOCKED: a card whose access rules refuse this app, as most adapter cards'.
+ *  REFUSING_SIM: an ordinary SIM, which refuses it the same way (no access rules for it). EMPTY: no card in the reader. */
+enum class FakeCard { OPEN, LOCKED, ORDINARY, REFUSING_SIM, EMPTY }
 
-/** OMAPI readers by slot. An OPEN card answers each APDU with [reply] (hex in, hex out). */
-class FakeReaders(private val cards: Map<Int, FakeCard>, var aid: String? = null,
+/** OMAPI readers by slot. An OPEN card answers each APDU with [reply] (hex in, hex out). Cards of a kind share an ATR,
+ *  unless [atrs] gives a slot's (hex; null: none). */
+class FakeReaders(private val cards: Map<Int, FakeCard>, var aid: String? = null, var atrs: Map<Int, String?> = emptyMap(),
                   private val reply: (String) -> String = { "9000" }) : OmapiApduBackend.Readers {
     val opened = ArrayList<String>()
     val sent = ArrayList<String>()
@@ -28,8 +30,10 @@ class FakeReaders(private val cards: Map<Int, FakeCard>, var aid: String? = null
     override fun openChannel(slot: Int, aid: ByteArray): OmapiApduBackend.SeChannel {
         opened += Hex.encode(aid)
         return when (cards[slot]) {
-            FakeCard.LOCKED -> throw SecurityException("SecureElement-AccessControlEnforcer no APDU access allowed")
+            FakeCard.LOCKED, FakeCard.REFUSING_SIM ->
+                throw SecurityException("SecureElement-AccessControlEnforcer no APDU access allowed")
             FakeCard.ORDINARY -> throw NoSuchElementException("applet not found")
+            FakeCard.EMPTY -> throw OmapiApduBackend.NoCardException()
             null -> throw IOException("no card")
             FakeCard.OPEN -> {
                 // A maker's own eSIM manager ID instead of the standard one.
@@ -44,9 +48,22 @@ class FakeReaders(private val cards: Map<Int, FakeCard>, var aid: String? = null
         }
     }
 
+    /** Reads of the ATR as the slot's session has it, and fresh ones. */
     var atrReads = 0
-    /** Cards of a kind share an ATR. */
-    override fun atr(slot: Int): ByteArray? = cards[slot]?.let { atrReads++; byteArrayOf(0x3B, it.ordinal.toByte()) }
+    var freshAtrReads = 0
+    /** As a session keeps it: the ATR of the card in the slot when it was first read. */
+    private val sessionAtrs = HashMap<Int, ByteArray?>()
+
+    override fun atr(slot: Int, fresh: Boolean): ByteArray? {
+        val card = cards[slot]?.takeIf { it != FakeCard.EMPTY } ?: return null
+        val now = if (slot in atrs) atrs[slot]?.let(Hex::decode) else byteArrayOf(0x3B, card.ordinal.toByte())
+        if (fresh) { freshAtrReads++; return now }
+        atrReads++
+        if (slot !in sessionAtrs) sessionAtrs[slot] = now
+        return sessionAtrs[slot]
+    }
+
+    override fun present(slot: Int) = cards[slot].let { it != null && it != FakeCard.EMPTY }
 
     override fun close() { closed = true }
 }

@@ -32,6 +32,32 @@ data class EuiccProfile(
 
 private fun String?.orNull() = this?.takeIf { it.isNotBlank() }
 
+/** A card: its [eid] says which, the rest where it answers, which only holds for one way in, as they number slots
+ *  differently. [isdR]: the eSIM manager ID it answered to. [builtIn]: see [Lpa.onBuiltInSlot]. */
+data class Card(val eid: String, val slot: Int, val isdR: String, val builtIn: Boolean)
+
+/** What [Lpa.scan] made of a slot. [token] and [logical] as [com.esimonsim.apdu.SlotInfo] gives them. [noManager]: every
+ *  eSIM manager ID was tried, and the card said it has no such thing. */
+class SlotLook(val slot: Int, val what: What, val card: Card? = null, val profiles: List<EuiccProfile>? = null,
+               val logical: Int? = null, val token: String? = null, val noManager: Boolean = false) {
+    enum class What {
+        /** No card to list here. */
+        EMPTY,
+        /** A card, in a slot the phone isn't using. */
+        IDLE,
+        /** [card] answers here. [profiles]: null if they couldn't be read. */
+        CARD,
+        /** Nothing changed: what's known of this slot stands. */
+        SAME,
+        /** Couldn't tell, as the card is busy: what's known stands, and the next look asks again. */
+        AGAIN,
+        /** The slot took card access down with it. */
+        HUNG,
+        /** An eSIM card, by its ATR, that refuses this way in: direct card access only. */
+        LOCKED,
+    }
+}
+
 private val Spaces = Regex("\\s+") // compiled once: nameKey runs per eSIM in composition, on every keystroke
 
 /** Names compared the way people read them: case, and spaces around and between words, don't count. */

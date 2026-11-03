@@ -1,0 +1,7 @@
+Google code scanner 16.1.0, ML Kit common, ML Kit vision common and ML Kit barcode scanning common:
+ML Kit Terms of Service
+https://developers.google.com/ml-kit/terms
+
+Google Play services base, basement and tasks, and ML Kit's image library:
+Android Software Development Kit License
+https://developer.android.com/studio/terms.html

@@ -105,8 +105,8 @@ jobs:
           (cd app/build/outputs/mapping \
             && zip "$GITHUB_WORKSPACE/dist/debug-symbols.zip" standaloneRelease/mapping.txt googleRelease/mapping.txt)
 
-      # What to download and how to get past the unknown-apps prompt. No generated list of changes: it's for developers,
-      # and this page is for people who want the app.
+      # What's new, what to download and how to get past the unknown-apps prompt. No generated list of changes: it's for
+      # developers, and this page is for people who want the app.
       - name: Write the release description
         run: |
           sed -e "s|{{repo}}|$GITHUB_REPOSITORY|g" -e "s|{{tag}}|$GITHUB_REF_NAME|g" \

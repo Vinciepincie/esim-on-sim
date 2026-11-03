@@ -12,6 +12,7 @@ import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Random;
 
@@ -22,6 +23,10 @@ import java.util.Random;
  * <pre>
  *   slot             the slot the card is in (default 1); absent: no card anywhere
  *   aid              the one eSIM manager ID the card answers to, as on some makers' cards (default: the usual one)
+ *   cards            instead of slot and aid, several cards: [{"slot":0},{"slot":1,"aid":"...","eid":"..."}]. Each keeps
+ *                    its own eSIMs, in fakecard-state.json for the first and fakecard-state-SLOT.json for the others
+ *                    (or "state", a file name), and restarts by itself
+ *   hangSlot         opening a channel in this slot never answers, so card access times out
  *   startDelayMs     before the helper answers at all (a slow app_process start)
  *   delayMs, jitterMs  per APDU, plus up to jitterMs more (a slow card)
  *   openDelayMs      per channel open
@@ -33,31 +38,52 @@ import java.util.Random;
  *   useSimDelayMs    how long after a switch the phone takes to pick the eSIM up (default 2000)
  *   useSimRefuse     the phone refuses SIM settings changes
  *   defaultDp        the card's default SM-DP+ address; rootDs its SM-DS (default lpa.ds.gsma.com)
- *   slots            what the "slots" request reports, e.g. [{"euicc":true,"removable":false}, ...]
+ *   slots            what the "slots" request reports, e.g. [{"euicc":true,"removable":false}, ...], also with
+ *                    present, active, logical, eid and token as CardShell gives them. A slot with "active":false
+ *                    throws when opened, as Android 10+ does for a slot it isn't using. It's Android's word, not
+ *                    worked out from "cards", so change it with them: a card taken out is {"euicc":true,
+ *                    "present":false} with no token, a card swapped for another gets a new token, and an ordinary
+ *                    SIM is {"euicc":false,"token":"x"} with no "cards" entry
+ *   omapi            SIM readers for direct card access, which the app then simulates itself with these same cards
+ *                    (see apdu/FakeOmapi.kt in the debug source set)
  * </pre>
  * The card itself (EID, eSIMs, notices) persists in /data/local/tmp/fakecard-state.json; delete
  * that file to start over with three eSIMs.
  */
 public final class FakeCardShell implements HelperServer.Session {
-    private static final File CONFIG = new File("/data/local/tmp/fakecard.json");
-    private static final File STATE = new File("/data/local/tmp/fakecard-state.json");
     private static final String GSMA_KEY = "81370F5125D0B1D408D4C3B232E6D25E795BEBFB";
     private static final String OTHER_KEY = "A1B2C3D4E5F60718293A4B5C6D7E8F9001122334";
     private static final int INSTALL = 0, ENABLE = 1, DISABLE = 2, DELETE = 3;
 
+    /** Where fakecard.json and the cards' state are. */
+    private final File dir;
+    /** In the app itself (apdu/FakeOmapi.kt): where its own copy of the cards' state goes, as apps may read
+     *  /data/local/tmp but not write there. Null in the helper. */
+    private final File home;
     private final Random random = new Random();
     private final Map<Integer, Channel> channels = new HashMap<>();
     private JSONObject cfg = new JSONObject();
+    /** The card a request is for, as [cards] numbers them, and its state. */
+    private int cardIndex;
     private JSONObject card;
     private int nextChannel = 1;
     private int apdus;
 
     private static final class Channel {
+        final int card;
+        Channel(int card) { this.card = card; }
         final ByteArrayOutputStream command = new ByteArrayOutputStream();
         byte[] reply = new byte[0];
         int replyAt;
         boolean dead; // the card restarted since it was opened
     }
+
+    public FakeCardShell() { this(new File("/data/local/tmp"), null); }
+
+    /** The cards [dir]'s fakecard.json describes, as the app reaches them itself; see [home]. */
+    public FakeCardShell(File dir, File home) { this.dir = dir; this.home = home; }
+
+    private File config() { return new File(dir, "fakecard.json"); }
 
     public static void main(String[] args) {
         // Background mode, as CardShell's: the same card, reached over loopback after the stream ends.
@@ -67,7 +93,7 @@ public final class FakeCardShell implements HelperServer.Session {
             int uid = android.os.Process.myUid();
             if (uid != 2000 && uid != 0) throw new SecurityException("ADB shell or root required");
             FakeCardShell shell = new FakeCardShell();
-            shell.cfg = read(CONFIG, new JSONObject());
+            shell.cfg = read(shell.config(), new JSONObject());
             Thread.sleep(shell.cfg.optLong("startDelayMs", 0));
             BufferedReader input = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
             String line;
@@ -89,9 +115,7 @@ public final class FakeCardShell implements HelperServer.Session {
     @Override public void close() { channels.clear(); }
 
     @Override public JSONObject handle(JSONObject q) throws Exception {
-        cfg = read(CONFIG, new JSONObject());
-        card = read(STATE, null);
-        if (card == null) card = newCard();
+        cfg = read(config(), new JSONObject());
         JSONObject out = new JSONObject();
         switch (q.getString("op")) {
             case "ping": return out.put("version", 1).put("uid", android.os.Process.myUid());
@@ -114,29 +138,75 @@ public final class FakeCardShell implements HelperServer.Session {
 
     private boolean restarting() { return System.currentTimeMillis() < card.optLong("refreshUntil"); }
 
+    /** The cards in the phone: "cards", or the one card "slot" and "aid" describe. */
+    private JSONArray cards() throws Exception {
+        if (cfg.optBoolean("absent")) return new JSONArray();
+        JSONArray all = cfg.optJSONArray("cards");
+        return all != null ? all : new JSONArray().put(new JSONObject().put("slot", cfg.optInt("slot", 1))
+            .put("aid", cfg.optString("aid", CardShell.ISD_R_AIDS.get(0))));
+    }
+
+    /** The card in [slot], as [cards] numbers them, or -1. */
+    private int indexIn(int slot) throws Exception {
+        JSONArray all = cards();
+        for (int i = 0; i < all.length(); i++) if (all.getJSONObject(i).optInt("slot", 1) == slot) return i;
+        return -1;
+    }
+
+    private File stateOf(int index) throws Exception {
+        JSONObject c = cards().optJSONObject(index);
+        if (c != null && c.has("state")) return new File(dir, c.getString("state"));
+        return new File(dir, index == 0 ? "fakecard-state.json" : "fakecard-state-" + (c == null ? index : c.optInt("slot", 1)) + ".json");
+    }
+
+    /** The helper's [file], or in the app its own copy where that's newer: the helper's changes show there, though not
+     *  the other way round. */
+    private File readFrom(File file) {
+        if (home == null) return file;
+        File own = writeTo(file);
+        return own.lastModified() >= file.lastModified() ? own : file;
+    }
+
+    private File writeTo(File file) { return home == null ? file : new File(home, file.getName()); }
+
+    /** Makes card [index] the one requests go to. */
+    private void use(int index) throws Exception {
+        cardIndex = index;
+        card = read(readFrom(stateOf(index)), null);
+        if (card == null) card = newCard(index, cards().optJSONObject(index));
+    }
+
     private JSONObject open(int slot, String aid, JSONObject out) throws Exception {
         if (!CardShell.ISD_R_AIDS.contains(aid)) throw new IllegalArgumentException("Unsupported card applet");
         Thread.sleep(cfg.optLong("openDelayMs", 0));
-        boolean here = !cfg.optBoolean("absent") && slot == cfg.optInt("slot", 1)
-            && aid.equals(cfg.optString("aid", CardShell.ISD_R_AIDS.get(0)));
+        if (cfg.optInt("hangSlot", -1) == slot) Thread.sleep(120_000);
+        JSONArray slots = cfg.optJSONArray("slots");
+        JSONObject info = slots == null ? null : slots.optJSONObject(slot);
+        if (info != null && info.has("active") && !info.getBoolean("active"))
+            throw new IllegalArgumentException("Invalid slot index " + slot);
+        int index = indexIn(slot);
+        boolean here = index >= 0 && aid.equals(cards().getJSONObject(index).optString("aid", CardShell.ISD_R_AIDS.get(0)));
         // IccOpenLogicalChannelResponse: INVALID_CHANNEL, and STATUS_NO_SUCH_ELEMENT or STATUS_UNKNOWN_ERROR.
         if (!here) return out.put("channel", -1).put("status", 3).put("select", "");
+        use(index);
         if (restarting()) return out.put("channel", -1).put("status", 4).put("select", "");
         int ch = nextChannel;
         nextChannel = nextChannel % 19 + 1;
-        channels.put(ch, new Channel());
+        channels.put(ch, new Channel(index));
         return out.put("channel", ch).put("status", 1).put("select", "6F108410A0000005591010FFFFFFFF89000001009000");
     }
 
     private String transmit(JSONObject q) throws Exception {
         Channel ch = channels.get(q.getInt("channel"));
         if (ch == null) throw new IllegalArgumentException("Channel is not owned by this session");
+        use(ch.card);
         if (ch.dead || restarting()) { ch.dead = true; throw new IllegalStateException("The card is restarting"); }
         long jitter = cfg.optLong("jitterMs", 0);
         Thread.sleep(cfg.optLong("delayMs", 0) + (jitter > 0 ? (long) (random.nextDouble() * jitter) : 0));
         apdus++;
-        if (cfg.has("hangAt") && apdus >= cfg.getInt("hangAt")) { cfg.remove("hangAt"); write(CONFIG, cfg); Thread.sleep(120_000); }
-        if (cfg.has("exitAt") && apdus >= cfg.getInt("exitAt")) { cfg.remove("exitAt"); write(CONFIG, cfg); System.exit(1); }
+        // The helper's own faults: in the app, which can't write the file anyway, they'd stop or hang the app itself.
+        if (home == null && cfg.has("hangAt") && apdus >= cfg.getInt("hangAt")) { cfg.remove("hangAt"); write(config(), cfg); Thread.sleep(120_000); }
+        if (home == null && cfg.has("exitAt") && apdus >= cfg.getInt("exitAt")) { cfg.remove("exitAt"); write(config(), cfg); System.exit(1); }
         if (random.nextDouble() < cfg.optDouble("failRate", 0)) return "6F00";
         int ins = q.getInt("ins");
         if (ins == 0xC0) return chunk(ch, q.getInt("p3"));
@@ -146,7 +216,7 @@ public final class FakeCardShell implements HelperServer.Session {
         byte[] command = ch.command.toByteArray();
         ch.command.reset();
         byte[] reply = es10(command);
-        write(STATE, card);
+        write(writeTo(stateOf(cardIndex)), card);
         if (reply == null) return "6A88";
         ch.reply = reply;
         ch.replyAt = 0;
@@ -229,11 +299,11 @@ public final class FakeCardShell implements HelperServer.Session {
         }
         p.put("enabled", enable);
         addNotice(enable ? ENABLE : DISABLE, p);
-        // REFRESH: the card restarts. Every open channel is gone, and it can't be opened for a while.
+        // REFRESH: the card restarts. Its open channels are gone, and it can't be opened for a while. Another card's aren't.
         card.put("refreshUntil", System.currentTimeMillis() + cfg.optLong("refreshMs", 3000));
-        for (Channel ch : channels.values()) ch.dead = true;
+        for (Channel ch : channels.values()) if (ch.card == cardIndex) ch.dead = true;
         if (cfg.optBoolean("dropEnableReply")) {
-            write(STATE, card);
+            write(writeTo(stateOf(cardIndex)), card);
             throw new IllegalStateException("The card reset before it answered");
         }
         return 0;
@@ -299,25 +369,34 @@ public final class FakeCardShell implements HelperServer.Session {
         return seq == null ? -1 : new BigInteger(seq.value).intValue();
     }
 
+    /** The eSIM is on, on whichever card, and the phone has had time to pick it up. */
     private JSONObject useSim(JSONObject q, JSONObject out) throws Exception {
         if (cfg.optBoolean("useSimRefuse")) throw new SecurityException("Not allowed to change SIM settings");
-        long ready = card.optLong("refreshUntil") + cfg.optLong("useSimDelayMs", 2000);
-        JSONArray all = card.getJSONArray("profiles");
-        for (int i = 0; i < all.length(); i++) {
-            JSONObject p = all.getJSONObject(i);
-            if (p.getBoolean("enabled") && System.currentTimeMillis() >= ready && p.getString("iccid").equals(q.getString("iccid")))
-                return out.put("applied", true);
+        for (int c = 0; c < cards().length(); c++) {
+            use(c);
+            long ready = card.optLong("refreshUntil") + cfg.optLong("useSimDelayMs", 2000);
+            JSONArray all = card.getJSONArray("profiles");
+            for (int i = 0; i < all.length(); i++) {
+                JSONObject p = all.getJSONObject(i);
+                if (p.getBoolean("enabled") && System.currentTimeMillis() >= ready && p.getString("iccid").equals(q.getString("iccid")))
+                    return out.put("applied", true);
+            }
         }
         return out.put("applied", false);
     }
 
-    private static JSONObject newCard() throws Exception {
-        JSONArray profiles = new JSONArray()
+    /** Card [index] as it starts out: the first with three eSIMs, others with two of their own. [c]: its "cards" entry. */
+    private static JSONObject newCard(int index, JSONObject c) throws Exception {
+        JSONArray profiles = new JSONArray();
+        if (index == 0) profiles
             .put(fakeProfile("8988247000000000011", "A0000005591010FFFFFFFF8900001000", true, "Firsty", "smdp.firsty.invalid"))
             .put(fakeProfile("8988247000000000029", "A0000005591010FFFFFFFF8900001100", false, "Roamless", "smdp.roamless.invalid"))
             .put(fakeProfile("8944478600000000037", "A0000005591010FFFFFFFF8900001200", false, "1GLOBAL", "smdp.1global.invalid"));
-        return new JSONObject().put("eid", "89049032000000000000000000012345").put("profiles", profiles)
-            .put("notices", new JSONArray()).put("nextSeq", 1);
+        else profiles
+            .put(fakeProfile(String.format(Locale.ROOT, "89882470000000%d0055", index), "A0000005591010FFFFFFFF8900001000", true, "Airalo", "smdp.airalo.invalid"))
+            .put(fakeProfile(String.format(Locale.ROOT, "89882470000000%d0063", index), "A0000005591010FFFFFFFF8900001100", false, "Holafly", "smdp.holafly.invalid"));
+        String eid = c != null && c.has("eid") ? c.getString("eid") : String.format(Locale.ROOT, "890490320000000000000000000%05d", 12345 + index * 1111);
+        return new JSONObject().put("eid", eid).put("profiles", profiles).put("notices", new JSONArray()).put("nextSeq", 1);
     }
 
     private static JSONObject fakeProfile(String iccid, String aid, boolean enabled, String name, String smdp) throws Exception {
@@ -388,7 +467,8 @@ public final class FakeCardShell implements HelperServer.Session {
     private static void write(File file, JSONObject json) throws Exception {
         File tmp = new File(file.getPath() + ".tmp");
         try (FileOutputStream out = new FileOutputStream(tmp)) { out.write(json.toString(1).getBytes(StandardCharsets.UTF_8)); }
-        if (!tmp.renameTo(file)) throw new IllegalStateException("Couldn't save " + file);
+        // Android's rename replaces the file; on Windows, where the JVM tests run, it has to go first.
+        if (!tmp.renameTo(file) && !(file.delete() && tmp.renameTo(file))) throw new IllegalStateException("Couldn't save " + file);
     }
 
     /** One BER-TLV; [value] is a copy, [end] the offset just past it in the parsed buffer. */

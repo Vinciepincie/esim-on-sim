@@ -1,5 +1,7 @@
 package com.esimonsim.apdu
 
+import org.json.JSONArray
+
 /** Low-level APDU access to a UICC slot. Implemented over Android's OMAPI, or a helper started
  *  through su, Shizuku or the built-in ADB client. */
 interface ApduBackend {
@@ -12,11 +14,36 @@ interface ApduBackend {
     /** Physical slots in order: whether each holds an eUICC, and whether Android counts it removable.
      *  Empty when unknown. */
     fun slots(): List<SlotInfo> = emptyList()
+    /** Whether a card is in [slot], as Android says without touching it. Null when it doesn't say. */
+    fun present(slot: Int): Boolean? = slots().getOrNull(slot)?.present
 }
 
-class SlotInfo(val euicc: Boolean, val removable: Boolean)
+/** A physical slot as Android sees it, without touching the card. [removable] is set per tray by the phone's maker, so it
+ *  says nothing about the card in it (a POCO calls a tray fixed). Null fields: Android didn't say, which isn't a no.
+ *  [active]: the phone is using the slot; opening one it isn't using throws. [logical]: Android's SIM number for it.
+ *  [eid]: Android knows the card's. [token]: changes with what Android sees in the slot, so an unchanged one saves a look;
+ *  it never proves the same card, and isn't an ICCID. */
+class SlotInfo(val euicc: Boolean, val removable: Boolean, val present: Boolean? = null, val active: Boolean? = null,
+               val logical: Int? = null, val eid: String? = null, val token: String? = null) {
+    internal companion object {
+        /** From the helper's list, whose slots can be empty objects. */
+        fun list(all: JSONArray) = List(all.length()) { i -> all.getJSONObject(i).let { o ->
+            SlotInfo(o.optBoolean("euicc"), o.optBoolean("removable", true),
+                if (o.has("present")) o.getBoolean("present") else null,
+                if (o.has("active")) o.getBoolean("active") else null,
+                if (o.has("logical")) o.getInt("logical") else null,
+                o.optString("eid").ifEmpty { null }, o.optString("token").ifEmpty { null })
+        } }
+    }
+}
 
-class OpenResult(val channel: Int, val status: Int, val selectResponse: ByteArray?)
+class OpenResult(val channel: Int, val status: Int, val selectResponse: ByteArray?) {
+    companion object {
+        /** Direct card access only: refused, and the card's ATR says it's an eSIM card. The helper never sends it:
+         *  telephony's statuses go up to 4. */
+        const val LOCKED = 100
+    }
+}
 
 /** [cardThere]: a card is in that slot, and this is what went wrong with it, which says more than "not found". */
 class ApduException(message: String, cause: Throwable? = null, val cardThere: Boolean = false) : Exception(message, cause) {

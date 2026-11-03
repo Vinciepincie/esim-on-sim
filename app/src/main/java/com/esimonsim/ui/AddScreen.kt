@@ -117,9 +117,9 @@ private fun InstallForm(ui: LpaUi, vm: LpaViewModel, code: String, setCode: (Str
     val bare = full == null && isBareCode(input)
     val ac = full ?: if (bare) ActivationCode.of(smdp, input) else null
     val needsCc = needsConfirmationCode(ac, ui.ccNeeded)
-    val prior = remember(ac, ui.profiles) { ac?.let(vm::priorInstall) }
-    val onCard = prior?.second
-    val canInstall = ui.eid != null && ac != null && (!needsCc || cc.isNotBlank()) && onCard == null
+    val prior = remember(ac, ui.profiles, ui.cards) { ac?.let(vm::priorInstall) }
+    val onCard = prior?.onCard
+    val canInstall = ui.mayInstall && ac != null && (!needsCc || cc.isNotBlank()) && onCard == null
 
     Column(Modifier.fillMaxSize().semantics { paneTitle = "Add eSIM" }) {
         Column(Modifier.weight(1f).clearFocusOnTap().verticalScroll(rememberScrollState()).padding(16.dp),
@@ -133,6 +133,10 @@ private fun InstallForm(ui: LpaUi, vm: LpaViewModel, code: String, setCode: (Str
                     ErrorNote(ui.error?.takeIf { ui.errorTitle == null } ?: "Couldn't read your eSIM card.")
                     OutlinedButton(onClick = vm::loadCard, modifier = Modifier.fillMaxWidth()) { Text("Try again") }
                 }
+            } else if (!ui.loading && ui.lookingForCards) {
+                // Install waits for this (see [LpaUi.mayInstall]): another card may turn up, and the code could be for it.
+                Text("Checking your phone's other SIM slots…", style = MaterialTheme.typography.bodyLarge,
+                    modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
             }
             // Says a scan worked out loud too, so a text that's always here (a new one wouldn't be announced), and not
             // the field's own line, which also changes as people type.
@@ -203,18 +207,32 @@ private fun InstallForm(ui: LpaUi, vm: LpaViewModel, code: String, setCode: (Str
                     imeAction = ImeAction.Done),
                 modifier = Modifier.fillMaxWidth(),
             ) else TextButton(onClick = { showCc = true }) { Text("I have a confirmation code") }
-            prior?.let { (install, existing) -> DuplicateNote(install, existing) { existing?.let(vm::showDuplicate) } }
-            ui.eid?.let { EidCard(it, "Some providers ask for it when you buy an eSIM.") }
-            WaitingEsims(ui.waiting, enabled = ui.eid != null, onCheck = vm::checkWaiting) {
-                vm.download(it.code, cc.trim().ifEmpty { null })
+            prior?.let { p -> DuplicateNote(p.install, p.onCard, p.onOther) { p.onCard?.let(vm::showDuplicate) } }
+            // Both are this card's: not before people say which card this is for.
+            if (!ui.pickCard) {
+                ui.eid?.let { EidCard(it, "Some providers ask for it when you buy an eSIM.") }
+                // Checking only reads this card; installing is gated in the ViewModel.
+                WaitingEsims(ui.waiting, enabled = ui.eid != null, onCheck = vm::checkWaiting) {
+                    vm.download(it.code, cc.trim().ifEmpty { null })
+                }
             }
             Text(installNote(ui.profiles), style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         Surface(tonalElevation = 0.dp, color = MaterialTheme.colorScheme.surface) {
-            Button(onClick = { ac?.let { vm.download(it, cc.trim().ifEmpty { null }, force = prior != null) } },
-                enabled = canInstall, modifier = Modifier.fillMaxWidth().padding(16.dp)) {
-                Text(if (prior != null && onCard == null) "Install anyway" else "Install")
+            // With several cards, which one this goes on is said on the button: a code often works only once.
+            var choose by remember(ui.pickCard) { mutableStateOf(false) }
+            Box(Modifier.padding(16.dp)) {
+                Button(onClick = { if (ui.pickCard) choose = true else ac?.let { vm.download(it, cc.trim().ifEmpty { null }, force = prior != null) } },
+                    enabled = if (ui.pickCard) !ui.loading && ui.busy == null else canInstall, modifier = Modifier.fillMaxWidth()) {
+                    Text(when {
+                        ui.pickCard -> "Choose a card"
+                        prior != null && onCard == null -> "Install anyway"
+                        ui.manageable >= 2 -> "Install on SIM ${ui.simNumber}"
+                        else -> "Install"
+                    })
+                }
+                if (ui.pickCard) CardMenu(ui, vm, choose) { choose = false }
             }
         }
     }
@@ -267,9 +285,11 @@ private fun WaitingEsims(waiting: List<Lpa.WaitingEsim>?, enabled: Boolean, onCh
     }
 }
 
-/** This code was installed by this app before: still on the card, or used once already. */
+/** This code was installed by this app before: still on the card, or used once already, perhaps for the eSIM now on the
+ *  card in [other]. */
 @Composable
-private fun DuplicateNote(install: com.esimonsim.data.ProfileStore.Install, onCard: EuiccProfile?, onShow: () -> Unit) {
+private fun DuplicateNote(install: com.esimonsim.data.ProfileStore.Install, onCard: EuiccProfile?, other: CardRow?,
+                          onShow: () -> Unit) {
     val date = DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(install.at))
     Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, shape = MaterialTheme.shapes.medium,
         modifier = Modifier.fillMaxWidth().semantics(mergeDescendants = true) { liveRegion = LiveRegionMode.Polite }) {
@@ -281,8 +301,9 @@ private fun DuplicateNote(install: com.esimonsim.data.ProfileStore.Install, onCa
                     Text(if (onCard != null) "Already on your card" else "Code used before",
                         style = MaterialTheme.typography.titleSmall)
                     Text(if (onCard != null) "You installed this eSIM on $date. It's on your card as \"${onCard.displayName}\"."
-                        else "You installed this code on $date (${install.name}). Most codes work only once, so the " +
-                            "provider will probably refuse it.",
+                        else "You installed this code on $date (${install.name})." +
+                            (other?.let { " It's on the card in SIM ${it.sim + 1}." } ?: "") +
+                            " Most codes work only once, so the provider will probably refuse it.",
                         style = MaterialTheme.typography.bodyMedium)
                 }
             }
@@ -346,7 +367,11 @@ private fun InstallProgress(busy: Busy, profiles: List<EuiccProfile>) {
 @Composable
 private fun InstallDone(p: EuiccProfile, ui: LpaUi, vm: LpaViewModel) {
     var name by rememberSaveable { mutableStateOf("") }
-    var setup by rememberSaveable { mutableStateOf(ui.switchSetup) } // kept with the name through rotation
+    // Kept with the name through rotation. With several cards a new eSIM usually comes for its data: a choice remembered
+    // from another card isn't this one's.
+    var setup by rememberSaveable { mutableStateOf(if (ui.manageable >= 2) ui.switchSetup.copy(mobileData = true) else ui.switchSetup) }
+    val context = LocalContext.current
+    val elsewhere = remember { ui.manageable >= 2 && dataElsewhere(context, ui.androidSlot) == true }
     val active = ui.profiles.firstOrNull { it.enabled && it.iccid != p.iccid }
     val tooLong = name.trim().toByteArray(Charsets.UTF_8).size > Lpa.MAX_NICKNAME_BYTES
     val taken = ui.profiles.firstOrNull { it.iccid != p.iccid && nameKey(it.displayName) == nameKey(name.ifBlank { p.displayName }) }
@@ -372,13 +397,13 @@ private fun InstallDone(p: EuiccProfile, ui: LpaUi, vm: LpaViewModel) {
                 isError = tooLong, singleLine = true,
                 keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Words, imeAction = ImeAction.Done),
                 modifier = Modifier.fillMaxWidth().padding(top = 8.dp))
-            Text(switchNote(active), style = MaterialTheme.typography.bodySmall,
+            Text(switchNote(active, ui.simNumber.takeIf { ui.manageable >= 2 }), style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             // Not only the card screen's banner: that one stays away once dismissed.
             if (ui.usbTip) Text("To switch to it later without Wi-Fi, turn on \"USB debugging\" first. See " +
-                "${path("Details", "Card access")}.", style = MaterialTheme.typography.bodySmall,
+                "\"USB debugging\" in this app's Settings.", style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (ui.canSetUpSim) SwitchOptions(setup) { setup = it }
+            if (ui.canSetUpSim) SwitchOptions(setup, dataElsewhere = elsewhere) { setup = it }
         }
         Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Button(onClick = { vm.finishInstall(name, switch = true, setup) }, enabled = !tooLong, modifier = Modifier.fillMaxWidth()) {

@@ -44,6 +44,28 @@ class ProfileStore internal constructor(private val prefs: SharedPreferences) {
 
     fun setLastSlot(how: AccessMethod?, slot: Int) = prefs.edit { putInt(LAST_SLOT + how, slot) }
 
+    /** The EID of the card someone last chose from several. Only ever set by that choice: a card shown because the chosen
+     *  one was out of the phone doesn't replace it, so the chosen one comes back when it does. */
+    fun chosenCard(): String? = prefs.getString(CHOSEN_CARD, null)
+
+    fun chooseCard(eid: String) = prefs.edit { putString(CHOSEN_CARD, eid) }
+
+    /** The slot [eid] was last found in by each way of reaching it, or -1. With several cards, [lastSlot] can't say. */
+    fun cardSlot(how: AccessMethod?, eid: String) = prefs.getInt("$CARD_SLOT$how:$eid", -1)
+
+    fun setCardSlot(how: AccessMethod?, eid: String, slot: Int) = prefs.edit { putInt("$CARD_SLOT$how:$eid", slot) }
+
+    /** A look found no eSIM manager behind this [token] in this slot, so it's not worth opening while the token stays.
+     *  Reconnecting asks again ([clearNoManagers]). */
+    fun noManager(how: AccessMethod?, slot: Int, token: String) = "$how:$slot:$token" in noManagers()
+
+    fun setNoManager(how: AccessMethod?, slot: Int, token: String) =
+        prefs.edit { putStringSet(NO_MANAGER, noManagers() + "$how:$slot:$token") }
+
+    fun clearNoManagers() = prefs.edit { remove(NO_MANAGER) }
+
+    private fun noManagers(): Set<String> = prefs.getStringSet(NO_MANAGER, null)?.toSet() ?: emptySet()
+
     /** People stopped card access, and haven't connected since. */
     fun stopped() = prefs.getBoolean(STOPPED, false)
 
@@ -91,6 +113,9 @@ class ProfileStore internal constructor(private val prefs: SharedPreferences) {
         private const val OWN_CARDS = "own-cards"
         private const val STOPPED = "card-access-stopped"
         private const val LAST_SLOT = "last-slot:"
+        private const val CHOSEN_CARD = "chosen-card"
+        private const val CARD_SLOT = "card-slot:"
+        private const val NO_MANAGER = "no-manager"
 
         /** Activation codes are stored only as a hash: enough to recognise one, useless to anyone reading it. */
         internal fun fingerprint(ac: ActivationCode): String {

@@ -1,0 +1,24 @@
+ZXing core 3.5.4
+https://github.com/zxing/zxing
+
+Copyright 2007 ZXing authors
+
+Under the Apache License, Version 2.0, which is below this project's NOTICE file:
+
+--------------------------------------------------------------------------------
+NOTICES FOR BARCODE4J
+--------------------------------------------------------------------------------
+
+Barcode4J
+Copyright 2002-2010 Jeremias Märki
+Copyright 2005-2006 Dietmar Bürkle
+
+Portions of this software were contributed under section 5 of the
+Apache License. Contributors are listed under:
+http://barcode4j.sourceforge.net/contributors.html
+
+--------------------------------------------------------------------------------
+NOTICES FOR JCOMMANDER
+--------------------------------------------------------------------------------
+
+Copyright 2010 Cedric Beust cedric@beust.com

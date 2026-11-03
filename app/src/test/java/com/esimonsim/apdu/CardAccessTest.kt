@@ -1,10 +1,12 @@
 package com.esimonsim.apdu
 
+import com.esimonsim.lpa.Hex
 import com.esimonsim.lpa.Lpa
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -17,6 +19,8 @@ class CardAccessTest {
     private val adb = FakeAdb()
     private var suStarts = 0
     private var cards = mapOf(1 to FakeCard.LOCKED)
+    /** See [FakeReaders.atrs]. */
+    private var atrs = emptyMap<Int, String?>()
     private var su: () -> Process = { throw IOException("Cannot run program \"su\": error=2, No such file or directory") }
 
     private var readers: FakeReaders? = null
@@ -24,7 +28,7 @@ class CardAccessTest {
 
     /** Android 16 unless [sdk] says otherwise: 10 and older have no Wireless debugging. */
     private fun access(suFound: Boolean = false, sdk: Int = 36, found: () -> Boolean = { suFound }) = CardAccess(prefs,
-        OmapiApduBackend { FakeReaders(cards).also { readers = it } },
+        OmapiApduBackend { FakeReaders(cards, atrs = atrs).also { readers = it } },
         RootApduBackend({ "/data/app/base.apk" }, { suStarts++; su() }),
         adb, findSu = found, sdk = sdk, shizuku = ShizukuApduBackend({ "/data/app/base.apk" }, shizuku))
 
@@ -38,6 +42,18 @@ class CardAccessTest {
         assertEquals(1, suStarts) // root first, but this phone isn't rooted
         assertTrue(adb.connects.isEmpty())
         assertEquals("DIRECT", prefs.values["method"]) // kept for next time
+    }
+
+    @Test fun directAccessSaysACardWasTakenOut() {
+        // What a refresh of the chosen card goes by, as OMAPI answers no card the way it answers an ordinary SIM.
+        val inPhone = mutableMapOf(0 to FakeCard.OPEN, 1 to FakeCard.OPEN)
+        cards = inPhone
+        val a = access()
+        a.connect(viaAdb = false)
+        assertEquals(AccessMethod.DIRECT, a.method)
+        inPhone[1] = FakeCard.EMPTY
+        assertEquals(false, a.present(1))
+        assertEquals(true, a.present(0))
     }
 
     @Test fun rootComesBeforeWirelessDebugging() {
@@ -489,6 +505,52 @@ class CardAccessTest {
         assertEquals(1, gate.waits)
         a.stop()
         a.connect()
+        assertEquals(1, gate.waits)
+    }
+
+    @Test fun adbThatWorkedLastTimeIsntHeldUpByAStoppedShizuku() {
+        adb.paired = true
+        prefs.values[CardAccess.METHOD] = "ADB"
+        val gate = FakeShizuku(running = false, mayRun = true).also { shizuku = it }
+        val a = access()
+        a.connect()
+        assertEquals(AccessMethod.ADB, a.method)
+        assertEquals(0, gate.waits)
+    }
+
+    @Test fun aShizukuAlreadyRunningStillComesBeforeAdb() {
+        adb.paired = true
+        prefs.values[CardAccess.METHOD] = "ADB"
+        val gate = FakeShizuku(running = true, mayRun = true).also { shizuku = it }
+        val a = access()
+        a.connect()
+        assertEquals(AccessMethod.SHIZUKU, a.method)
+        assertEquals(0, gate.waits)
+    }
+
+    @Test fun shizukuIsStillWaitedForWhereAdbCantTakeOver() {
+        prefs.values[CardAccess.METHOD] = "ADB"
+        // Reconnect: someone asked, perhaps having just started it.
+        adb.paired = true
+        var gate = FakeShizuku(running = false, mayRun = true, arrives = true).also { shizuku = it }
+        var a = access()
+        a.connect(again = true)
+        assertEquals(AccessMethod.SHIZUKU, a.method)
+        assertEquals(1, gate.waits)
+        // ADB not tried this time.
+        prefs.values[CardAccess.METHOD] = "ADB"
+        gate = FakeShizuku(running = false, mayRun = true, arrives = true).also { shizuku = it }
+        a = access()
+        a.connect(viaAdb = false)
+        assertEquals(AccessMethod.SHIZUKU, a.method)
+        assertEquals(1, gate.waits)
+        // Chosen, whatever worked last time.
+        prefs.values[CardAccess.METHOD] = "ADB"
+        prefs.values[CardAccess.PREFERRED] = "SHIZUKU"
+        gate = FakeShizuku(running = false, mayRun = true, arrives = true).also { shizuku = it }
+        a = access()
+        a.connect()
+        assertEquals(AccessMethod.SHIZUKU, a.method)
         assertEquals(1, gate.waits)
     }
 
@@ -983,5 +1045,374 @@ class CardAccessTest {
         adb.ready = false
         assertTrue(a.useSim(1, "8944", data = true, roaming = true).applied)
         assertEquals(listOf(true, false), adb.authorized) // a switch later: no question
+    }
+
+    // ---------------- a way chosen in this app's Settings ----------------
+
+    /** Each way that's tried, in turn. */
+    private val tried = ArrayList<String>()
+
+    /** Every way there, each failing and saying when it's tried: root turned down, a card that refuses this app,
+     *  Shizuku that allows this app but won't start its helper, and Wireless debugging paired but off. */
+    private fun everyWayFails(): CardAccess {
+        su = { tried += "root"; FakeSu(exitAtOnce = true) { null } }
+        shizuku = FakeShizuku(mayRun = true, process = { tried += "shizuku"; throw IOException("stuck") })
+        val off = object : CardAccess.Adb by adb {
+            override val wasPaired = true
+            override fun connect(port: Int?, authorize: Boolean) { tried += "adb"; throw IOException("Couldn't find Wireless debugging.") }
+        }
+        return CardAccess(prefs, OmapiApduBackend { tried += "direct"; FakeReaders(cards) },
+            RootApduBackend({ "x" }, { su() }), off, findSu = { true }, shizuku = ShizukuApduBackend({ "x" }, shizuku))
+    }
+
+    @Test fun aChosenWayGoesFirstAndOnlyWaysThatAskNothingBackItUp() {
+        val orders = mapOf(
+            null to listOf("root", "direct", "shizuku", "adb"), // as ever
+            AccessMethod.DIRECT to listOf("direct", "shizuku", "adb"),
+            AccessMethod.ROOT to listOf("root", "shizuku", "adb", "direct"),
+            AccessMethod.SHIZUKU to listOf("shizuku", "adb", "direct"),
+            AccessMethod.ADB to listOf("adb", "shizuku", "direct"))
+        for ((way, order) in orders) {
+            prefs.values.clear()
+            tried.clear()
+            val a = everyWayFails()
+            a.prefer(way)
+            assertThrows(IOException::class.java) { a.connect() }
+            assertEquals("$way", order, tried)
+        }
+    }
+
+    @Test fun waysBehindAChosenOneNeverAsk() {
+        // Root that would ask, and Shizuku that would: neither was chosen.
+        su = { FakeSu(helper = helperAs(0)) }
+        val gate = FakeShizuku(installed = true, running = true, mayRun = false).also { shizuku = it }
+        for (way in listOf(AccessMethod.ADB, AccessMethod.DIRECT)) {
+            prefs.values.clear()
+            val a = access(suFound = true)
+            a.prefer(way)
+            assertThrows(SetupNeededException::class.java) { a.connect() }
+            assertEquals(0, suStarts)
+            assertEquals(0, gate.asks)
+            assertEquals(0, gate.waits) // nor waited for
+        }
+        // Not even when someone reconnects.
+        val a = access(suFound = true)
+        assertThrows(SetupNeededException::class.java) { a.connect(again = true) }
+        assertEquals(0, suStarts)
+        assertEquals(0, gate.asks)
+    }
+
+    @Test fun shizukuBehindAChosenWayIsWaitedForOnceWhereDirectAccessComesNext() {
+        // A card that lets this app in, and Shizuku that allows it but hands over its connection only after the start.
+        cards = mapOf(1 to FakeCard.OPEN)
+        val gate = FakeShizuku(running = false, mayRun = true, arrives = true).also { shizuku = it }
+        prefs.values[CardAccess.PREFERRED] = "ADB"
+        adb.paired = true
+        val a = access()
+        a.connect(viaAdb = false) // Wireless debugging is off
+        assertEquals(AccessMethod.SHIZUKU, a.method) // it reaches every card, where direct access may miss one
+        assertEquals(1, gate.waits)
+        // Once: Shizuku that isn't running then isn't waited for again.
+        gate.running = false
+        a.disconnect()
+        a.connect(viaAdb = false)
+        assertEquals(AccessMethod.DIRECT, a.method)
+        assertEquals(1, gate.waits)
+        // Behind a chosen Direct, which came first, there's nothing to wait for.
+        prefs.values.clear()
+        prefs.values[CardAccess.PREFERRED] = "DIRECT"
+        cards = mapOf(1 to FakeCard.LOCKED)
+        gate.running = false
+        assertThrows(SetupNeededException::class.java) { access().connect(viaAdb = false) }
+        assertEquals(1, gate.waits)
+    }
+
+    @Test fun usbDebuggingBehindAChosenWayOnlyAsksOnItsOwnScreens() {
+        prefs.values[CardAccess.PREFERRED] = "DIRECT"
+        adb.tcpOpen = true // a computer turned the debugging port on, and the phone never allowed this app
+        val a = access(sdk = 29)
+        assertThrows(SetupNeededException::class.java) { a.connect(again = true) }
+        assertTrue(adb.authorized.isEmpty())
+        // Its setup screen's "Connect": the phone may ask there.
+        a.connect(again = true, forAdb = true)
+        assertEquals(AccessMethod.ADB, a.method)
+        assertEquals(listOf(true), adb.authorized)
+        // Allowed now: tried behind the chosen way too, without asking.
+        a.disconnect()
+        a.connect(again = true)
+        assertEquals(AccessMethod.ADB, a.method)
+        assertEquals(listOf(true, false), adb.authorized)
+    }
+
+    @Test fun aChosenWayThatFailsFallsBackAndSaysWhy() {
+        prefs.values[CardAccess.PREFERRED] = "SHIZUKU"
+        adb.paired = true
+        val gate = FakeShizuku(running = false, mayRun = true).also { shizuku = it }
+        val a = access()
+        a.connect()
+        assertEquals(AccessMethod.ADB, a.method)
+        assertEquals(AccessMethod.SHIZUKU, a.preferred) // the choice stands for next time
+        assertTrue(a.preferredFailure is ShizukuApduBackend.NotRunningException)
+        assertEquals(1, gate.waits) // the chosen way is waited for, as ever
+        // Started again: Reconnect takes the chosen way.
+        gate.running = true
+        a.disconnect()
+        a.connect(again = true)
+        assertEquals(AccessMethod.SHIZUKU, a.method)
+        assertNull(a.preferredFailure)
+    }
+
+    @Test fun directAccessComesLastBehindAChosenWay() {
+        prefs.values[CardAccess.PREFERRED] = "SHIZUKU"
+        shizuku = FakeShizuku(running = false)
+        cards = mapOf(1 to FakeCard.OPEN)
+        adb.paired = true
+        val a = access()
+        a.connect()
+        assertEquals(AccessMethod.ADB, a.method) // it reaches every card, where direct access may miss one
+        assertNull(readers)
+        // With nothing else, direct access it is.
+        adb.paired = false
+        val b = access()
+        b.connect()
+        assertEquals(AccessMethod.DIRECT, b.method)
+        assertTrue(b.preferredFailure is ShizukuApduBackend.NotRunningException)
+    }
+
+    @Test fun chosenWirelessDebuggingThatIsOffCostsNothing() {
+        prefs.values[CardAccess.PREFERRED] = "ADB"
+        adb.paired = true
+        cards = mapOf(1 to FakeCard.OPEN)
+        val a = access()
+        a.connect(viaAdb = false) // as the app connects while Wireless debugging is off
+        assertTrue(adb.connects.isEmpty())
+        assertEquals(AccessMethod.DIRECT, a.method)
+        assertSame(CardAccess.NotTried, a.preferredFailure)
+        assertNull(a.reason(CardAccess.NotTried))
+        // A fallback that worked once doesn't cover up the chosen way next time.
+        a.disconnect()
+        a.connect()
+        assertEquals(AccessMethod.ADB, a.method)
+        assertNull(a.preferredFailure)
+    }
+
+    @Test fun chosenAdbSaysWhatsWrongWithItWhenNothingElseConnects() {
+        prefs.values[CardAccess.PREFERRED] = "ADB"
+        for (failure in listOf(PairingRequiredException(), DebuggingPortClosedException(), NearbyDevicesNeededException())) {
+            val broken = object : CardAccess.Adb by adb {
+                override val wasPaired = true
+                override fun connect(port: Int?, authorize: Boolean) = throw failure
+            }
+            val a = CardAccess(prefs, OmapiApduBackend { FakeReaders(cards) }, RootApduBackend({ "x" }, { su() }), broken,
+                findSu = { false }, sdk = 29)
+            assertSame(failure, assertThrows(IOException::class.java) { a.connect(again = true) })
+            assertSame(failure, a.preferredFailure)
+        }
+    }
+
+    @Test fun aChosenWayIsWorthConnectingUntilItFailed() {
+        prefs.values[CardAccess.PREFERRED] = "DIRECT"
+        val a = access(suFound = true)
+        assertTrue(a.withoutSetup)
+        val e = assertThrows(SetupNeededException::class.java) { a.connect() }
+        assertTrue(e.message!!, e.message!!.startsWith("Couldn't open your card directly"))
+        assertTrue(a.preferredFailure is OmapiApduBackend.UnavailableException)
+        assertTrue(a.directRefused)
+        // Root was never tried, but it's no way in behind a chosen one: nothing left to try by itself.
+        assertFalse(a.withoutSetup)
+        assertEquals(0, suStarts)
+        cards = mapOf(1 to FakeCard.OPEN)
+        a.connect(again = true)
+        assertEquals(AccessMethod.DIRECT, a.method)
+        assertFalse(a.directRefused)
+    }
+
+    @Test fun switchingConnectsTheNewWayBeforeEndingTheOld() {
+        cards = mapOf(1 to FakeCard.OPEN)
+        adb.paired = true
+        adb.helper = true // up for SIM settings
+        val a = access()
+        a.connect()
+        assertEquals(AccessMethod.DIRECT, a.method)
+        a.switchTo(AccessMethod.ADB)
+        assertEquals(AccessMethod.ADB, a.method)
+        assertTrue(a.isReady())
+        assertTrue(readers!!.closed) // direct access ended once the new way worked
+        // And back: the helper stays, for SIM settings.
+        a.switchTo(AccessMethod.DIRECT)
+        assertEquals(AccessMethod.DIRECT, a.method)
+        assertEquals(0, adb.stops)
+        assertTrue(adb.helper)
+        assertFalse(adb.isReady())
+        assertTrue(a.canSetUpSim)
+        // The way in use already: nothing to do.
+        val opened = readers
+        a.switchTo(AccessMethod.DIRECT)
+        assertSame(opened, readers)
+    }
+
+    @Test fun switchingToUsbDebuggingCanTakeThePortTypedAfterAdbTcpip() {
+        cards = mapOf(1 to FakeCard.OPEN)
+        adb.paired = true // allowed before
+        val a = access(sdk = 29)
+        a.connect(viaAdb = false)
+        assertEquals(AccessMethod.DIRECT, a.method)
+        a.switchTo(AccessMethod.ADB, port = 5556)
+        assertEquals(AccessMethod.ADB, a.method)
+        assertEquals(listOf<Int?>(5556), adb.connects)
+        assertEquals(listOf(true), adb.authorized) // the phone may ask to allow this app
+    }
+
+    @Test fun aSwitchThatFailsLeavesCardAccessAsItWas() {
+        adb.paired = true
+        val a = access()
+        a.connect()
+        assertEquals(AccessMethod.ADB, a.method)
+        assertThrows(OmapiApduBackend.UnavailableException::class.java) { a.switchTo(AccessMethod.DIRECT) }
+        assertTrue(a.directRefused)
+        assertThrows(ShizukuApduBackend.NotRunningException::class.java) { a.switchTo(AccessMethod.SHIZUKU) }
+        assertThrows(RootApduBackend.NotRootedException::class.java) { a.switchTo(AccessMethod.ROOT) }
+        assertTrue(a.isReady())
+        assertEquals(AccessMethod.ADB, a.method)
+        assertEquals(1, adb.connects.size)
+    }
+
+    @Test fun aCancelledSwitchLeavesCardAccessAsItWas() {
+        cards = mapOf(1 to FakeCard.OPEN)
+        adb.paired = true
+        val gate = FakeShizuku(mayRun = true).also { shizuku = it }
+        val a = access()
+        a.connect(viaAdb = false)
+        assertEquals(AccessMethod.DIRECT, a.method)
+        // Cancel tapped while Wireless debugging connected, and while Shizuku started this app's helper.
+        assertThrows(ConnectCancelledException::class.java) { a.switchTo(AccessMethod.ADB) { adb.connects.isNotEmpty() } }
+        assertFalse(adb.isReady())
+        assertThrows(ConnectCancelledException::class.java) { a.switchTo(AccessMethod.SHIZUKU) { gate.starts > 0 } }
+        assertEquals(AccessMethod.DIRECT, a.method)
+        assertEquals("DIRECT", prefs.values[CardAccess.METHOD])
+        assertTrue(a.isReady())
+        assertFalse(readers!!.closed)
+        assertNull(a.preferred)
+    }
+
+    @Test fun switchingToShizukuAsksItWhenItDoesNotAllowThisAppYet() {
+        cards = mapOf(1 to FakeCard.OPEN)
+        val gate = FakeShizuku().also { shizuku = it }
+        val a = access()
+        a.connect()
+        a.switchTo(AccessMethod.SHIZUKU)
+        assertEquals(1, gate.asks)
+        assertEquals(AccessMethod.SHIZUKU, a.method)
+        // Already allowed, as for SIM settings: no question.
+        a.switchTo(AccessMethod.DIRECT)
+        a.switchTo(AccessMethod.SHIZUKU)
+        assertEquals(1, gate.asks)
+    }
+
+    @Test fun automaticAgainTriesOnlyTheWaysAboveTheOneInUse() {
+        val gate = FakeShizuku(mayRun = true).also { shizuku = it }
+        prefs.values[CardAccess.PREFERRED] = "SHIZUKU"
+        adb.paired = true
+        val a = access()
+        a.connect()
+        assertEquals(AccessMethod.SHIZUKU, a.method)
+        // The card refuses direct access: Shizuku stays, and nothing below it is tried.
+        a.switchTo(null)
+        assertEquals(AccessMethod.SHIZUKU, a.method)
+        assertTrue(a.isReady())
+        assertEquals(1, gate.starts)
+        assertTrue(adb.connects.isEmpty())
+        // A card that lets this app in: direct access, which comes first.
+        cards = mapOf(1 to FakeCard.OPEN)
+        a.switchTo(null)
+        assertEquals(AccessMethod.DIRECT, a.method)
+        assertTrue(a.isReady())
+        a.prefer(null)
+        assertNull(a.preferred)
+    }
+
+    @Test fun automaticAgainAsksNothingNew() {
+        // Root turned down before, Shizuku not allowed yet: neither asked. Not connected: the ways that are set up.
+        prefs.values[CardAccess.ROOT_DECLINED] = true
+        val gate = FakeShizuku().also { shizuku = it }
+        adb.paired = true
+        val a = access(suFound = true)
+        a.switchTo(null)
+        assertEquals(AccessMethod.ADB, a.method)
+        assertEquals(0, suStarts)
+        assertEquals(0, gate.asks)
+    }
+
+    @Test fun cardsThatRefusedAreAddedToAndReplacedOnReconnect() {
+        // A 5ber in SIM 1, a card that lets this app in in SIM 2.
+        cards = mapOf(0 to FakeCard.LOCKED, 1 to FakeCard.OPEN)
+        val fiveBer = Hex.encode(byteArrayOf(0x3B, FakeCard.LOCKED.ordinal.toByte()))
+        access().connect()
+        assertEquals(setOf(fiveBer), prefs.values[CardAccess.REFUSED])
+        // The next start asks it nothing.
+        access().connect()
+        assertEquals(listOf(Lpa.ISD_R), readers!!.opened)
+        // A card from before stays listed while another refuses...
+        prefs.values[CardAccess.REFUSED] = setOf("3BFF")
+        access().connect()
+        assertEquals(setOf("3BFF", fiveBer), prefs.values[CardAccess.REFUSED])
+        // ...until someone reconnects, which asks them all.
+        access().connect(again = true)
+        assertEquals(setOf(fiveBer), prefs.values[CardAccess.REFUSED])
+        // Also when nothing lets this app in.
+        prefs.values[CardAccess.REFUSED] = setOf("3BFF")
+        cards = mapOf(0 to FakeCard.LOCKED)
+        assertThrows(SetupNeededException::class.java) { access().connect() }
+        assertEquals(setOf("3BFF", fiveBer), prefs.values[CardAccess.REFUSED])
+    }
+
+    @Test fun aCardOfTheMakeOfOneThatRefusedIsStillAskedAtTheNextStart() {
+        // Two cards of one make, so one ATR: the one in SIM 1 refuses this app, the one in SIM 2 lets it in.
+        cards = mapOf(0 to FakeCard.LOCKED, 1 to FakeCard.OPEN)
+        atrs = mapOf(0 to "3B9F", 1 to "3B9F")
+        access().connect()
+        assertNull(prefs.values[CardAccess.REFUSED])
+        val a = access()
+        a.connect()
+        assertEquals(AccessMethod.DIRECT, a.method)
+    }
+
+    @Test fun shizukuThatCantStartTheHelperIsNotTriedAgainByItself() {
+        prefs.values["method"] = "SHIZUKU"
+        val gate = FakeShizuku(mayRun = true, process = { throw IOException("stuck") }).also { shizuku = it }
+        val a = access()
+        val e = assertThrows(SetupNeededException::class.java) { a.connect() }
+        assertTrue(e.message!!, e.message!!.startsWith("Shizuku couldn't start"))
+        assertFalse(a.withoutSetup) // or it would try again at every return to the app
+        assertThrows(SetupNeededException::class.java) { a.connect(again = true) } // but Reconnect does
+        assertEquals(2, gate.starts)
+        assertTrue(a.shizukuAppeared()) // and so does Shizuku changing
+        assertTrue(a.withoutSetup)
+    }
+
+    @Test fun theChoiceIsKeptForNextTime() {
+        val a = access()
+        assertNull(a.preferred)
+        a.prefer(AccessMethod.SHIZUKU)
+        assertEquals(AccessMethod.SHIZUKU, access().preferred)
+        a.prefer(null)
+        assertNull(access().preferred)
+        assertFalse(CardAccess.PREFERRED in prefs.values)
+        prefs.values[CardAccess.PREFERRED] = "SOMETHING_NEWER"
+        assertNull(access().preferred)
+    }
+
+    @Test fun directAccessIsOfferedWhereThePhoneHasSimReaders() {
+        var asked = 0
+        fun access(supported: Boolean, readers: Map<Int, FakeCard>) = CardAccess(prefs,
+            OmapiApduBackend { FakeReaders(readers) }, RootApduBackend({ "x" }, { su() }), adb, findSu = { false },
+            directSupported = { asked++; supported })
+        val a = access(true, emptyMap())
+        assertEquals(0, asked) // not at start
+        assertTrue(a.directAvailable)
+        assertThrows(SetupNeededException::class.java) { a.connect() }
+        assertFalse(a.directAvailable) // readers, but none for SIM cards
+        assertEquals(1, asked)
+        assertFalse(access(false, cards).directAvailable)
     }
 }

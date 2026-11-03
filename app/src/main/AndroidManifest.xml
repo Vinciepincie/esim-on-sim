@@ -73,7 +73,7 @@
                 <data android:scheme="LPA" tools:ignore="AppLinkUrlError" />
             </intent-filter>
             <!-- "Install on iPhone" links. Unverified, so Android 12+ opens them here only once people allow it
-                 (Details › eSIM links). -->
+                 (Settings › eSIM links). -->
             <intent-filter android:autoVerify="false">
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />

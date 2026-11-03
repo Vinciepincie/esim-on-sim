@@ -88,6 +88,8 @@ and uses the first that works:
 | Android 11 or newer | Follow the app's checklist: about 2 minutes, no computer or root |
 | Android 6 to 10 | Connect a computer once, and again after each restart. The app shows how |
 
+To pick a way yourself, open **⋮ › Settings** and tap **Card access**. The app then tries that one first.
+
 The checklist uses **Wireless debugging**, an Android feature for developers. Good to know:
 
 - Android turns it off when your phone restarts or Wi-Fi changes. Turn it back on and the app reconnects.
@@ -109,6 +111,18 @@ Yes. Your eSIMs are stored on the card, not in the app.
 It depends on the provider. Most QR codes work only once, so the same code usually won't work again, but many providers can
 give you a new eSIM. Some charge for that, and data or credit left on the old one may not carry over, so ask them before you
 delete it. If you just want it out of the list, choose Hide instead.
+</details>
+
+<details>
+<summary><b>I have two eSIM cards. Can I use both?</b></summary>
+
+Yes. With both in your phone, tap **Card in SIM 1** at the top of the app to switch between them. When you add an eSIM
+from another app, such as a shared QR code, the app asks which card it goes on. On Android 6 the app reaches only the
+card in SIM 1, and on Android 7 to 9 a card outside SIM 1 may show only while one of its eSIMs is on.
+
+Two eSIM cards in your SIM slots, but only one shows? One of them may not let this app in directly. Open **⋮ › Settings**,
+tap **Card access** and choose Shizuku or Wireless debugging (USB debugging on Android 9 and 10). On Android 10 and newer
+those reach both cards. On Android 9 they reach a card outside SIM 1 only while one of its eSIMs is on.
 </details>
 
 <details>
@@ -134,7 +148,7 @@ The app has no account or analytics, and nothing goes to the app's makers.
 <summary><b>Is Wireless debugging safe?</b></summary>
 
 While it's on, only devices you paired with a code can connect, and this app uses it only to reach your card. You can stop
-card access at any time from the ⋮ menu.
+card access at any time in the app's Settings (⋮ menu).
 </details>
 
 <details>

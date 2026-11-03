@@ -2,6 +2,7 @@ package com.esimonsim.data
 
 import android.content.Context
 import android.content.ContextWrapper
+import com.esimonsim.apdu.AccessMethod
 import com.esimonsim.apdu.MemoryPrefs
 import com.esimonsim.lpa.ActivationCode
 import org.junit.Assert.assertEquals
@@ -35,6 +36,28 @@ class ProfileStoreTest {
         assertFalse(ProfileStore(context).usbTipDismissed())
         ProfileStore(context).dismissUsbTip()
         assertTrue(ProfileStore(context).usbTipDismissed())
+    }
+
+    @Test fun cardsAreRememberedByEidForEachWayIn() {
+        val prefs = MemoryPrefs()
+        val context = object : ContextWrapper(null) {
+            override fun getApplicationContext(): Context = this
+            override fun getSharedPreferences(name: String?, mode: Int) = prefs
+        }
+        val store = ProfileStore(context)
+        assertEquals(null, store.chosenCard())
+        store.chooseCard("89049032000000000000000000012345")
+        assertEquals("89049032000000000000000000012345", ProfileStore(context).chosenCard())
+        store.setCardSlot(AccessMethod.ADB, "89049032000000000000000000012345", 1)
+        assertEquals(1, store.cardSlot(AccessMethod.ADB, "89049032000000000000000000012345"))
+        // Each way in numbers slots its own way.
+        assertEquals(-1, store.cardSlot(AccessMethod.DIRECT, "89049032000000000000000000012345"))
+        store.setNoManager(AccessMethod.ADB, 0, "abc")
+        assertTrue(store.noManager(AccessMethod.ADB, 0, "abc"))
+        assertFalse(store.noManager(AccessMethod.ADB, 0, "abd")) // another SIM there
+        assertFalse(store.noManager(AccessMethod.ROOT, 0, "abc"))
+        store.clearNoManagers()
+        assertFalse(store.noManager(AccessMethod.ADB, 0, "abc"))
     }
 
     @Test fun fingerprintDoesNotContainTheCode() {

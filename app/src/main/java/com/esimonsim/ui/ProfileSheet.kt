@@ -113,7 +113,9 @@ fun ProfileSheet(p: EuiccProfile, ui: LpaUi, vm: LpaViewModel, onHide: (EuiccPro
                     Icon(painterResource(R.drawable.ic_delete), contentDescription = null, Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp)); Text("Delete from card")
                 }
-                if (p.enabled) Text("Turn this eSIM off before deleting it.", style = MaterialTheme.typography.bodySmall,
+                // Switching never leaves the card with no eSIM on, which some phones stop seeing.
+                if (p.enabled) Text(if (ui.profiles.size > 1) "To delete it, first switch to another eSIM."
+                    else "Turn this eSIM off before deleting it.", style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(horizontal = 12.dp))
             }
         }

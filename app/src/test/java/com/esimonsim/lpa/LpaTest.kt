@@ -97,6 +97,53 @@ class LpaTest {
         for (reach in listOf(SlotReach.FIRST_OR_ACTIVE, SlotReach.FIRST_ONLY)) assertTrue("SIM 1" in message(reach))
     }
 
+    @Test fun anEsimCardThatRefusesDirectAccessIsNamedWhenNoCardLetsThisAppIn() {
+        // Direct access, with the card that let this app in taken out: the one left in SIM 2 refuses it.
+        val locked = object : ApduBackend by FakeCard({ "9000" }) {
+            override fun openChannel(slot: Int, port: Int, aidHex: String) =
+                if (slot == 1 && aidHex == Lpa.ISD_R_OPEN) OpenResult(0, OpenResult.LOCKED, null) else OpenResult(0, 3, null)
+        }
+        val e = assertThrows(ApduException::class.java) { Lpa(locked).discover() }
+        assertEquals(Lpa.notFoundLocked(2), e.message)
+        assertTrue(e.message!!, "SIM 2" in e.message!! && "Change card access" in e.message!!)
+        assertTrue(Lpa.isLockedOnly(e.message))
+        assertFalse(Lpa.isLockedOnly(Lpa.NOT_FOUND))
+        assertFalse(Lpa.isLockedOnly(null))
+        // Where not every slot can be reached, the card may be in one that isn't: that's what's said, as ever.
+        val reach = assertThrows(ApduException::class.java) { Lpa(locked, slotReach = { SlotReach.FIRST_OR_ACTIVE }).discover() }
+        assertEquals(Lpa.NOT_FOUND_FIRST_OR_ACTIVE, reach.message)
+    }
+
+    @Test fun theCardInViewSwappedForOneThatRefusesDirectAccessIsNamed() {
+        val card = FakeCard { if (it.endsWith("BF3E035C015A")) "BF3E125A10${eid}9000" else "9000" }
+        var swapped = false
+        val backend = object : ApduBackend by card {
+            override fun openChannel(slot: Int, port: Int, aidHex: String) =
+                if (swapped && slot == 1) OpenResult(0, OpenResult.LOCKED, null) else card.openChannel(slot, port, aidHex)
+        }
+        val lpa = Lpa(backend)
+        assertEquals(eid, lpa.discover())
+        swapped = true
+        // Not "status 100": what the app makes of it, the refresh too (see LpaViewModel.loadCard).
+        assertEquals(Lpa.notFoundLocked(2), assertThrows(ApduException::class.java) { lpa.read() }.message)
+    }
+
+    @Test fun anEsimCardThatRefusesDirectAccessLeavesTheCardBesideIt() {
+        val card = FakeCard { "BF3E125A10${eid}9000" }
+        card.cardSlot = 2
+        val asked = ArrayList<Int>()
+        val both = object : ApduBackend by card {
+            override fun openChannel(slot: Int, port: Int, aidHex: String): OpenResult {
+                asked += slot
+                return if (slot == 0) OpenResult(0, OpenResult.LOCKED, null) else card.openChannel(slot, port, aidHex)
+            }
+        }
+        val lpa = Lpa(both)
+        assertEquals(eid, lpa.discover())
+        assertEquals(2, lpa.slot)
+        assertEquals(listOf(1, 0, 2), asked) // passed over on the way
+    }
+
     @Test fun theLastEsimOnStaysOnWhereTurningItOffWouldPutTheCardOutOfReach() {
         // Android 7-9 through the helper, the card in SIM 2: refused before the card is touched.
         val (lpa, card) = connected({ SlotReach.FIRST_OR_ACTIVE }) { error("must not reach the card") }
@@ -669,10 +716,33 @@ class LpaTest {
     }
 
     @Test fun anEmptyListStaysAnEmptyList() {
-        for (reply in listOf("BF2D02A000", "BF2D00")) {
+        val (lpa, _) = connected { "BF2D02A0009000" }
+        assertEquals(emptyList<EuiccProfile>(), lpa.getProfiles())
+    }
+
+    @Test fun anAnswerWithNoListInItIsNotAnEmptyCard() {
+        // Nothing in it, something else in it, or another command's answer: read as an empty card, the re-read
+        // after a delete or a turn-off would confirm it.
+        for (reply in listOf("BF2D00", "BF2D03800100", "BF3203800100")) {
             val (lpa, _) = connected { reply + "9000" }
-            assertEquals(emptyList<EuiccProfile>(), lpa.getProfiles())
+            assertEquals(reply, "The card sent an answer this app can't read. Try again.",
+                assertThrows(ApduException::class.java) { lpa.getProfiles() }.message)
         }
+    }
+
+    @Test fun eSimsOutsideAListStillShow() {
+        // No card is known to leave out the A0 around its eSIMs, but one that did worked before, so it still does.
+        val list = Tlv.buildSeq(0xBF2D, Tlv.buildSeq(0xE3, Tlv.build(0x5A, Hex.decode("984474680000000030F7")),
+            Tlv.build(0x4F, Hex.decode(aid))))
+        val (lpa, _) = connected { Hex.encode(list) + "9000" }
+        assertEquals(listOf("8944478600000000037"), lpa.getProfiles().map { it.iccid })
+    }
+
+    @Test fun aChangeIsNotSentWhenTheListSaysNothing() {
+        val (lpa, card) = connected(reply = onCard(list = "BF2D009000") { error("must not reach the card: $it") })
+        assertThrows(ApduException::class.java) { lpa.delete(esim) }
+        assertThrows(ApduException::class.java) { lpa.disable(esim) }
+        assertTrue(card.sent().isEmpty())
     }
 
     @Test fun enableSendsProfileIdAndRefreshFlag() {
@@ -759,9 +829,17 @@ class LpaTest {
 
     @Test fun setNicknameSendsPaddedIccidAndUtf8Name() {
         val (lpa, card) = connected { "BF29038001009000" }
-        lpa.setNickname("8944478600000000037", " Saily ")
+        assertTrue(lpa.setNickname("8944478600000000037", " Saily "))
         assertEquals("BF29135A0A984474680000000030F790055361696C79", data(card.apdus.single()))
         assertEquals(0, card.openChannels)
+    }
+
+    @Test fun aRenameAnswerWithoutItsResultLeavesItToTheList() {
+        // No answer, no result in it, or another command's answer: not "done", and not a failure either.
+        for (reply in listOf("9000", "BF29009000", "BF32038001009000")) {
+            val (lpa, _) = connected { reply }
+            assertFalse(reply, lpa.setNickname("8944478600000000037", "Trip"))
+        }
     }
 
     @Test fun cardInfoIsReadFromEuiccInfo2() {
@@ -820,12 +898,19 @@ class LpaTest {
             if (reason.isEmpty()) ByteArray(0) else Tlv.build(0x81, reason)))
         val (lpa, _) = connected { error("must not reach the card") }
         fun message(r: ByteArray) = assertThrows(ApduException::class.java) { lpa.verifyInstall(r) }.message!!
-        lpa.verifyInstall(result(Tlv.build(0xA0, ByteArray(0)))) // successResult
+        assertTrue(lpa.verifyInstall(result(Tlv.build(0xA0, ByteArray(0))))) // successResult
         assertEquals("This eSIM is already on the card.", message(failed(9)))
         assertEquals("The install was interrupted. Try again.", message(failed(11)))
         assertTrue(message(failed(12)), message(failed(12)).startsWith("The card couldn't install this eSIM (error 12). "))
         assertTrue(message(failed()), message(failed()).startsWith("The card couldn't install this eSIM (error unknown). "))
-        assertTrue(message(ByteArray(0)), message(ByteArray(0)).startsWith("The card didn't say whether the install worked"))
+        // Words that say whether trying again can help.
+        assertEquals("The eSIM was damaged on the way to the card (error 8). Try again.", message(failed(8)))
+        for (r in listOf<Byte>(4, 5, 6, 13, 15)) assertTrue(message(failed(r)).startsWith("This eSIM can't be installed on this card"))
+        for (r in listOf<Byte>(4, 12, 15)) assertFalse(message(failed(r)), "try again" in message(failed(r)).lowercase())
+        // No result in it: not a success, and not a failure either. The list on the card has to say.
+        for (r in listOf(ByteArray(0), Hex.decode("BF3700"), Hex.decode("BF3203800100"), Tlv.buildSeq(0xBF37,
+            Tlv.buildSeq(0xBF27, Tlv.build(0x80, ByteArray(16))), Tlv.build(0x5F37, ByteArray(64)))))
+            assertFalse(Hex.encode(r), lpa.verifyInstall(r))
     }
 
     @Test fun aPackageTheCardNeverAnswersLeavesTheInstallUnknown() {
@@ -975,8 +1060,18 @@ class LpaTest {
     @Test fun deliveredNoticesAreClearedBySequenceNumber() {
         val (lpa, card) = connected { "BF30038001009000" }
         lpa.removeNotifications(listOf(6, 200))
-        assertEquals(listOf("BF3003800106", "BF3004800200C8"), card.apdus.map(::data))
+        assertEquals(listOf("BF3E035C015A", "BF3003800106", "BF3004800200C8"), card.apdus.map(::data))
         assertEquals(0, card.openChannels)
+    }
+
+    @Test fun anotherCardPutInWhileNoticesWereSentKeepsItsOwn() {
+        // A notice's number means something only on the card that gave it.
+        val (lpa, card) = connected { "BF30038001009000" }
+        val other = FakeCard { if (it.endsWith("BF3E035C015A")) "BF3E125A10${eid.reversed()}9000" else "BF30038001009000" }
+        val swapped = Lpa(other).at(lpa.card!!)
+        swapped.removeNotifications(listOf(6))
+        assertEquals(listOf("BF3E035C015A"), other.apdus.map(::data))
+        assertTrue(card.apdus.isEmpty())
     }
 
     @Test fun noticesWithNothingToSendCountAsDelivered() {

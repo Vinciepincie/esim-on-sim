@@ -29,8 +29,8 @@ android {
         // Android 17: finding Wireless debugging's ports over mDNS needs the Nearby devices permission (asked
         // for just before pairing or connecting); the loopback connections themselves don't.
         targetSdk = 37
-        versionCode = 3
-        versionName = "0.3"
+        versionCode = 4
+        versionName = "0.4"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         // Phones only: skip the x86/x86_64 copies of the native libs (emulators, Chromebooks).
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
@@ -44,7 +44,7 @@ android {
     // Same app ID and signature, so either build installs over the other and keeps the pairing.
     flavorDimensions += "services"
     productFlavors {
-        // Scans QR codes with its own camera screen. No Google code: works without Play services.
+        // Scans QR codes with its own camera screen. No Play services or ML Kit code: works without them.
         create("standalone") {
             dimension = "services"
             isDefault = true
@@ -98,6 +98,8 @@ android {
         dex.useLegacyPackaging = true
         resources.excludes += listOf(
             "/META-INF/{AL2.0,LGPL2.1}", "/META-INF/*.version", "/kotlin/**",
+            // The same Apache License five times over, where nobody reads it: the Licenses page has it.
+            "/META-INF/androidx/**/LICENSE.txt",
             "DebugProbesKt.bin", "kotlin-tooling-metadata.json",
             // BouncyCastle's data files (~1.2 MB of post-quantum tables, CertPathReviewer messages): libadb
             // only uses its HKDF and AES-GCM classes for pairing, which read none of them.

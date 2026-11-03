@@ -249,7 +249,8 @@ class Es9Client(private val smdp: String, private val connectTimeoutMs: Int = 30
         fun unb64(s: String): ByteArray = Base64.withPadding(Base64.PaddingOption.PRESENT_OPTIONAL)
             .decode(if (s.any(Char::isWhitespace)) s.filterNot(Char::isWhitespace) else s)
 
-        /** SGP.22 ES9+ status codes (subject / reason) for the rejections people actually hit. */
+        /** SGP.22 ES9+ status codes (subject / reason) for the rejections people actually hit, grouped by what they can
+         *  do about them. By subject where the reason adds nothing: servers don't agree on the reasons they send. */
         internal fun describe(subject: String, reason: String): String = when {
             reason == "4.8" -> "The card doesn't have room for this eSIM. Delete an eSIM you no longer use, then try again."
             reason == "6.4" -> "Too many attempts for this eSIM. Ask your provider for a new activation code."
@@ -257,8 +258,29 @@ class Es9Client(private val smdp: String, private val connectTimeoutMs: Int = 30
             subject == "8.2.6" -> "The provider refused this activation code. It may be mistyped, expired or already used."
             subject == "8.2.7" -> "The provider needs a valid confirmation code for this eSIM."
             subject == "8.8.5" -> "This eSIM can't be downloaded any more. It may have expired or already been installed."
+            // The card's certificates or its standard: refused before the activation code is even sent, so it's unused.
+            subject in NOT_THIS_CARD || (subject == "8.1" && reason == "6.1") ->
+                "This provider doesn't accept this eSIM card, so trying again won't help. Ask the provider whether its " +
+                    "eSIMs work on removable eSIM cards."
+            // Only "execution error" in the standard, though some providers send it for a card they won't serve.
+            subject == "8.8" && reason == "4.2" -> "The provider couldn't serve this eSIM card. If trying again later " +
+                "doesn't help, ask the provider whether its eSIMs work on removable eSIM cards, and quote this code."
             subject == "8.1.1" -> "The provider won't send this eSIM to this card. It may be tied to another device."
+            subject == "8.2" && reason == "1.2" -> "This eSIM isn't ready to download yet. Wait a while, or ask your " +
+                "provider when it will be."
+            subject == "8.2" && reason == "3.7" -> "This eSIM can't be downloaded any more: it may have been downloaded " +
+                "already. Ask your provider to issue it again."
+            // No eSIM it holds suits this card or phone (its eligibility check): a new code for the same one fails too.
+            subject == "8.2.5" && reason == "4.3" -> "The provider says this eSIM can't be used on this card or phone. " +
+                "Ask the provider whether its eSIMs work on removable eSIM cards, and quote this code."
+            subject == "8.8.1" -> "This provider's server doesn't recognise the address in the activation code. Check the " +
+                "code, or ask your provider for the right one."
+            subject == "8.10.1" -> "The provider lost track of this download. Try again."
             else -> "The eSIM provider refused the request. Ask your provider for help and quote this code."
         }
+
+        /** Subjects that say the provider won't serve this card: its maker's certificate (EUM), its own, the
+         *  certificate issuer or public key it trusts, or the standard version it follows. */
+        private val NOT_THIS_CARD = setOf("8.1.2", "8.1.3", "8.8.2", "8.8.3", "8.8.4", "8.11.1")
     }
 }

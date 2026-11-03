@@ -110,6 +110,21 @@ class OmapiApduBackendTest {
         assertTrue(backend.openChannel(0, 0, Lpa.ISD_R_OPEN).channel > 0)
         assertEquals(esimMe, readers.opened.last())
         assertTrue(backend.isReady())
+        // Its old slot still has an entry, but no card there lets this app in: a refusal starts card access over.
+        cards[0] = FakeCard.LOCKED
+        assertThrows(ApduException::class.java) { backend.openChannel(0, 0, Lpa.ISD_R_OPEN) }
+        assertFalse(backend.isReady())
+    }
+
+    @Test fun aRefusalByOneCardLeavesTheOtherCardsAccess() {
+        val cards = mutableMapOf(0 to FakeCard.OPEN, 1 to FakeCard.OPEN)
+        val backend = OmapiApduBackend { FakeReaders(cards) }
+        backend.connect()
+        for (s in 0..1) backend.closeChannel(s, 0, backend.openChannel(s, 0, Lpa.ISD_R_OPEN).channel)
+        cards[1] = FakeCard.LOCKED
+        assertEquals(0, backend.openChannel(1, 0, Lpa.ISD_R_OPEN).channel)
+        assertTrue(backend.isReady())
+        assertTrue(backend.openChannel(0, 0, Lpa.ISD_R_OPEN).channel > 0)
     }
 
     @Test fun anIdTheCardRefusesThisAppIsOnlyThatId() {
@@ -188,5 +203,126 @@ class OmapiApduBackendTest {
         assertEquals(0, backend.openChannel(0, 0, Lpa.ISD_R_OPEN).channel)
         backend.disconnect()
         assertFalse(backend.isReady())
+    }
+
+    // ---------------- an eSIM card that refuses this app, told by its ATR ----------------
+
+    private val fiveBer = "3B9F96803FC7828031E073FE211B57AA8660F001001EE1"
+    /** A USIM's: T=15, but no TB after it. */
+    private val ordinarySim = "3B9E95801FC78031E073FE211B66D001A11B0E00"
+
+    @Test fun theAtrSaysEsimCardAsAndroidReadsIt() {
+        for (atr in listOf("3F979580BFFE8210428031A073BE211797", "3B9F97C00A3FC6828031E073FE211F65D002341512810F51", fiveBer,
+            "3F979580BFFE8310428031A073BE211797", "3F979580BFFE9210428031A073BE211797", // other bits don't matter
+            fiveBer.dropLast(2))) // no check byte, as a phone may leave it off
+            assertTrue(atr, OmapiApduBackend.saysEuicc(Hex.decode(atr)))
+        for (atr in listOf("3F979580BEFE8210428031A073BE211797", // T=14, not 15
+            "3F979580BFFE8110428031A073BE211797", // b8 without b2
+            "3F979580B0FE0010428031A073BE2117", ordinarySim, "3B9F96803F", "3B9F", "3B", ""))
+            assertFalse(atr, OmapiApduBackend.saysEuicc(Hex.decode(atr)))
+        assertFalse(OmapiApduBackend.saysEuicc(null))
+    }
+
+    @Test fun anEsimCardThatRefusesThisAppIsToldApartFromAnOrdinarySim() {
+        val readers = FakeReaders(mapOf(0 to FakeCard.LOCKED, 1 to FakeCard.OPEN, 2 to FakeCard.REFUSING_SIM, 3 to FakeCard.LOCKED),
+            atrs = mapOf(0 to fiveBer, 2 to ordinarySim, 3 to null))
+        val backend = OmapiApduBackend { readers }
+        backend.connect()
+        val locked = backend.openChannel(0, 0, Lpa.ISD_R_OPEN)
+        assertEquals(OpenResult.LOCKED, locked.status)
+        assertEquals(0, locked.channel)
+        assertEquals(3, backend.openChannel(2, 0, Lpa.ISD_R_OPEN).status)
+        assertEquals(3, backend.openChannel(3, 0, Lpa.ISD_R_OPEN).status) // no ATR to go by
+        assertTrue(backend.isReady()) // nothing to do with the card that lets this app in
+        assertEquals(3, readers.freshAtrReads)
+    }
+
+    @Test fun phonesWithAnEsimOfTheirOwnFlagNoCard() {
+        // Their built-in chip could look the same, and they don't need telling.
+        val readers = FakeReaders(mapOf(0 to FakeCard.LOCKED, 1 to FakeCard.OPEN), atrs = mapOf(0 to fiveBer))
+        var asked = 0
+        val backend = OmapiApduBackend(flagLocked = { asked++; false }) { readers }
+        backend.connect()
+        assertEquals(0, asked) // only once a card refuses
+        assertEquals(3, backend.openChannel(0, 0, Lpa.ISD_R_OPEN).status)
+        assertEquals(3, backend.openChannel(0, 0, Lpa.ISD_R_OPEN).status)
+        assertEquals(1, asked)
+        assertEquals(0, readers.freshAtrReads)
+    }
+
+    @Test fun aCardSwappedSinceIsToldByItsAtrNow() {
+        // The slot's session still has the ATR of the ordinary SIM that was there; a 5ber is now.
+        val readers = FakeReaders(mapOf(0 to FakeCard.REFUSING_SIM, 1 to FakeCard.OPEN), atrs = mapOf(0 to ordinarySim))
+        val backend = OmapiApduBackend { readers }
+        backend.connect()
+        readers.atrs = mapOf(0 to fiveBer)
+        assertEquals(OpenResult.LOCKED, backend.openChannel(0, 0, Lpa.ISD_R_OPEN).status)
+        assertFalse(OmapiApduBackend.saysEuicc(readers.atr(0)))
+        // And the other way round.
+        readers.atrs = mapOf(0 to ordinarySim)
+        assertEquals(3, backend.openChannel(0, 0, Lpa.ISD_R_OPEN).status)
+    }
+
+    @Test fun aCardThatLetThisAppInSwappedForARefusingOneIsLockedWhileAnotherStillOpens() {
+        val cards = mutableMapOf(0 to FakeCard.OPEN, 1 to FakeCard.OPEN)
+        val readers = FakeReaders(cards)
+        val backend = OmapiApduBackend { readers }
+        backend.connect()
+        for (s in 0..1) backend.closeChannel(s, 0, backend.openChannel(s, 0, Lpa.ISD_R_OPEN).channel)
+        cards[1] = FakeCard.LOCKED
+        readers.atrs = mapOf(1 to fiveBer)
+        // Said as for any other slot, so a refresh of that card finds whichever card is in the phone now.
+        assertEquals(OpenResult.LOCKED, backend.openChannel(1, 0, Lpa.ISD_R_OPEN).status)
+        assertTrue(backend.isReady())
+    }
+
+    @Test fun aCardTakenOutIsToldFromOneThatWontOpen() {
+        val cards = mutableMapOf(0 to FakeCard.OPEN, 1 to FakeCard.ORDINARY)
+        val backend = OmapiApduBackend { FakeReaders(cards) }
+        assertNull(backend.present(0)) // not connected: nothing to say
+        backend.connect()
+        assertEquals(true, backend.present(0))
+        assertEquals(true, backend.present(1))
+        assertEquals(false, backend.present(3)) // no reader there
+        cards[0] = FakeCard.EMPTY
+        assertEquals(3, backend.openChannel(0, 0, Lpa.ISD_R_OPEN).status) // the same as for an ordinary SIM...
+        assertEquals(false, backend.present(0)) // ...but Android says there's no card
+    }
+
+    @Test fun onlyARefusalCostsAnAtrRead() {
+        val readers = FakeReaders(mapOf(0 to FakeCard.EMPTY, 1 to FakeCard.OPEN, 2 to FakeCard.ORDINARY))
+        val backend = OmapiApduBackend { readers }
+        backend.connect()
+        assertEquals(3, backend.openChannel(0, 0, Lpa.ISD_R_OPEN).status)
+        backend.closeChannel(1, 0, backend.openChannel(1, 0, Lpa.ISD_R_OPEN).channel)
+        assertEquals(3, backend.openChannel(2, 0, Lpa.ISD_R_OPEN).status)
+        assertEquals(3, backend.openChannel(3, 0, Lpa.ISD_R_OPEN).status) // no reader at all
+        assertEquals(0, readers.freshAtrReads)
+    }
+
+    @Test fun connectSaysWhichCardsRefusedBeforeOneLetThisAppIn() {
+        val readers = FakeReaders(mapOf(0 to FakeCard.LOCKED, 1 to FakeCard.OPEN, 2 to FakeCard.LOCKED),
+            atrs = mapOf(0 to fiveBer, 2 to ordinarySim))
+        assertEquals(setOf(fiveBer), OmapiApduBackend { readers }.connect()) // the card after it was never asked
+        // One of the same make that lets this app in: that make isn't one that refuses.
+        val same = FakeReaders(mapOf(0 to FakeCard.LOCKED, 1 to FakeCard.OPEN), atrs = mapOf(0 to fiveBer, 1 to fiveBer))
+        assertEquals(emptySet<String>(), OmapiApduBackend { same }.connect())
+        // Connected already: nothing new.
+        val backend = OmapiApduBackend { readers }
+        backend.connect()
+        assertEquals(emptySet<String>(), backend.connect())
+    }
+
+    @Test fun readersButNoneForSimCardsAreSaid() {
+        val none = OmapiApduBackend { FakeReaders(emptyMap()) }
+        assertThrows(OmapiApduBackend.UnavailableException::class.java) { none.connect() }
+        assertTrue(none.noReaders)
+        val some = OmapiApduBackend { FakeReaders(mapOf(0 to FakeCard.ORDINARY)) }
+        assertThrows(OmapiApduBackend.UnavailableException::class.java) { some.connect() }
+        assertFalse(some.noReaders)
+        // No service at all says nothing about its readers.
+        val noService = OmapiApduBackend { throw java.io.IOException("Secure element service unavailable") }
+        assertThrows(OmapiApduBackend.UnavailableException::class.java) { noService.connect() }
+        assertFalse(noService.noReaders)
     }
 }

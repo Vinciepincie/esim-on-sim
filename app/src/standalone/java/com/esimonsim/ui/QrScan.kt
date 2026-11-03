@@ -3,10 +3,14 @@ package com.esimonsim.ui
 import android.content.Context
 import androidx.compose.runtime.Composable
 
-/** QR scanning in the standalone build: always the app's own camera screen ([ScanActivity]), no Google code. */
+/** QR scanning in the standalone build: always the app's own camera screen ([ScanActivity]), no Play services or ML Kit
+ *  code. */
 object QrScan {
     /** Nothing to add to what the setup screen says about the internet: the scanner never goes online. */
     const val NETWORK_NOTE: String = ""
+
+    /** Nothing to add to the Licenses page: the scanner is ZXing and the app's own screen. */
+    internal val LIBRARIES: List<Library> = emptyList()
 
     /** Nothing to fetch: the scanner is part of the app. (The google build's QrScan has the same API.) */
     @Suppress("UNUSED_PARAMETER")
