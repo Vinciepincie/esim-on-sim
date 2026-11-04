@@ -366,7 +366,10 @@ debugging), and remembers the one that worked. All but ADB are tried once per ap
 start and on Reconnect.
 `Lpa.discover` asks every slot for the usual ISD-R ID first, then for makers' own eSIM manager IDs (eSIM.me, 5ber, XeSIM,
 LinksField, ESTKme; the list is `CardShell.ISD_R_AIDS`), so a standard card never costs an ordinary SIM those extra
-tries. `OmapiApduBackend` opens the full ISD-R AID, or a maker's ID when only that one is allowed. Each
+tries. The last ID in that list is the whole standard ISD-R AID in lower case (`Lpa.ISD_R_LOWER`), tried behind all of
+them: a card that won't take the 15-byte prefix still selects ISD-R from the full ID, and the lower case still slips past
+the Android 13+ telephony check that keeps the exact upper-case ID for the system LPA (it compares as text). A card that
+takes the prefix keeps using it, as the prefix wins first. `OmapiApduBackend` opens the full ISD-R AID, or a maker's ID when only that one is allowed. Each
 try makes Android check the card's access rules on the card (tens of ms), so cards that
 refused every AID are remembered by ATR and skipped at later starts (Reconnect asks
 them again). Not the ATR of the card that let the app in: two cards of one make share it, and one may refuse where the
@@ -400,6 +403,19 @@ component added for card access is the provider Shizuku's server hands its conne
 `INTERACT_ACROSS_USERS_FULL` can reach. Channel ownership is tracked per helper session, and channels are closed when its
 input ends.
 
+The helper reaches the card through the phone's telephony first (the calls above), and falls back to the **Secure Element
+HAL** (`android.hardware.secure_element.ISecureElement`, Android 11+) only when telephony gives no channel for a slot, or
+the phone has none of telephony's channel calls at all. The HAL is the layer below both telephony and Android's own OMAPI
+service: a card the phone's telephony won't open (a ROM that restricts the channel calls, or has none) can still answer
+there, below the OMAPI app check that direct access runs into. The helper looks up `.../SIM1`, `.../SIM2` from
+`ServiceManager` by slot (once per slot; a missing one is remembered so discovery never waits on it again), calls
+`openLogicalChannel`, `transmit` and `closeChannel`, and **never `init` or `reset`**: that service is shared with
+Android's own secure-element service and other apps' channels. The HAL sends the APDU straight to the card, so the helper
+puts the logical channel in the class byte itself (`CardShell.classByte`, ISO 7816-4), where telephony takes it as a
+separate argument. Whether the helper's Shell (or root) user may reach the HAL at all is a ROM and SELinux matter: where
+it can't, `getService` returns null and the telephony result stands. This changes the Android access route only; it does
+not rewrite the card's access rules, patch Android or defeat the operator's own profile authentication.
+
 Complete card operations are serialized on one process-wide thread. Installs and switches run under a short foreground
 service and a capped wake lock (`CardWork`), so leaving the app can't cut one off midway. A lost connection aborts the
 operation; mutating APDUs are never automatically replayed. Before each switch, turn-off and delete the app re-reads the
@@ -409,7 +425,9 @@ On phones with a built-in eSIM, slots Android reports as a fixed eUICC are tried
 last, so a removable card elsewhere wins. If that chip is all it finds, the app holds it back and says so, instead of
 showing it as the card, until someone confirms it's their removable card. The partial ISD-R identifier is
 still required on the tested phone because its telephony service restricts the
-full standard identifier to the system LPA.
+full standard identifier to the system LPA; the lower-case full identifier and the Secure Element HAL route above are
+fallbacks for phones where the partial one or telephony itself won't do, and neither has been confirmed on a real
+phone yet.
 
 ### Several cards
 

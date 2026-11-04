@@ -46,6 +46,10 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
         // selected by partial-AID match (ISO 7816-4, P2 = first occurrence), which
         // still resolves to ISD-R while differing from the full AID string.
         const val ISD_R_OPEN = "A0000005591010FFFFFFFF89000001"
+        // The whole standard ID in lower case (the last of CardShell.ISD_R_AIDS). A card that won't accept the prefix
+        // still selects ISD-R from it, and the lower case still passes the Android 13+ check that reserves the exact
+        // upper-case ID for the system LPA. Tried last in discover(), so the prefix wins where a card takes it.
+        const val ISD_R_LOWER = "a0000005591010ffffffff8900000100"
         private const val MSS = 120 // ES10 STORE DATA max block payload (per lpac)
         const val MAX_NICKNAME_BYTES = 64 // profileNickname UTF8String (SIZE(0..64))
         internal const val CARD_FULL = "The card doesn't have enough free space for this eSIM. Delete an eSIM you no " +
