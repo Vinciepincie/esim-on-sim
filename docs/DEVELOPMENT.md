@@ -404,17 +404,50 @@ component added for card access is the provider Shizuku's server hands its conne
 input ends.
 
 The helper reaches the card through the phone's telephony first (the calls above), and falls back to the **Secure Element
-HAL** (`android.hardware.secure_element.ISecureElement`, Android 11+) only when telephony gives no channel for a slot, or
-the phone has none of telephony's channel calls at all. The HAL is the layer below both telephony and Android's own OMAPI
-service: a card the phone's telephony won't open (a ROM that restricts the channel calls, or has none) can still answer
-there, below the OMAPI app check that direct access runs into. The helper looks up `.../SIM1`, `.../SIM2` from
-`ServiceManager` by slot (once per slot; a missing one is remembered so discovery never waits on it again), calls
-`openLogicalChannel`, `transmit` and `closeChannel`, and **never `init` or `reset`**: that service is shared with
-Android's own secure-element service and other apps' channels. The HAL sends the APDU straight to the card, so the helper
-puts the logical channel in the class byte itself (`CardShell.classByte`, ISO 7816-4), where telephony takes it as a
-separate argument. Whether the helper's Shell (or root) user may reach the HAL at all is a ROM and SELinux matter: where
-it can't, `getService` returns null and the telephony result stands. This changes the Android access route only; it does
-not rewrite the card's access rules, patch Android or defeat the operator's own profile authentication.
+HAL** (`android.hardware.secure_element.ISecureElement`, the AIDL HAL, Android 14+; 11-13 have only the older HIDL one,
+which the helper doesn't use) when telephony gives no channel for a slot, refuses the helper outright (it throws, as for an
+ID it keeps for the system LPA), or the phone has none of telephony's channel calls at all. When the HAL can't help either,
+telephony's own answer or exception goes back to the app unchanged, so its messages stay the same. The HAL is the layer
+below both telephony and Android's own OMAPI service: a card the phone's telephony won't open can still answer there,
+below the OMAPI app check that direct access runs into.
+
+- **Loading it.** The HAL's Java interface isn't among the classes every process has: it comes inside Android's own
+  secure-element app, `com.android.se`. The helper asks the package manager where that system app's APK is
+  (`MATCH_SYSTEM_ONLY`), accepts it only on a read-only system partition (`CardShell.systemApk`: never `/data`, so never
+  code an app could have written), and loads the interface from it with a `PathClassLoader`, once per process. This
+  happens the first time telephony misses, so a phone telephony serves never pays for it (a few milliseconds). Plain
+  `Class.forName` can't find the class, which is why the first version of this route never ran.
+- **Using it.** The helper looks up `.../SIM1`, `.../SIM2` from `ServiceManager` by slot, the order Android's own
+  secure-element app uses (Android doesn't define how those numbers map to slots). It calls `isCardPresent`,
+  `openLogicalChannel`, `transmit` and `closeChannel`, and **never `init` or `reset`**: the HAL is shared with Android's own
+  secure-element service and other apps' channels, and those calls would reset them. So it works only once that service
+  has set the HAL up. The HAL sends the APDU straight to the card, so the helper puts the logical channel in the class byte
+  itself (`CardShell.classByte`, ISO 7816-4); a channel the HAL numbers past 19 is given back unused. A failed transmit
+  keeps its channel, so the app's close gives it back, as Android's own secure-element app does. A channel is forgotten
+  without a close only where it's known to be gone: the HAL's process went away, or the card answered 6881 (channel not
+  open, as after it restarted). The HAL may have given that number to someone else by then.
+- **Who may use it.** That is a ROM and SELinux matter. AOSP's policy lets ADB shell look the HAL up but not call it: its
+  clients are the secure-element app, OMAPI and, on userdebug builds only, `su`. Android reports the refused call as a
+  `DeadObjectException`, the same exception as for a HAL (or the phone process) that went away. The helper tells them
+  apart by the HAL's binder: still alive after a refusal, when it leaves that slot's HAL alone for a minute
+  (`HAL_RETRY_MS`) and telephony's answer stands; dead after the HAL's process went, when the next open looks it up
+  afresh. Neither is taken for the phone process dying. So over Wireless debugging or Shizuku the route helps only on
+  makers' builds that let shell call the HAL (users of another app report this on some Xiaomi and OPPO builds), and with
+  root where the root manager's policy allows it.
+- **Tested** on Android 14, 17 and 17 QPR2 emulators against a stand-in HAL: the helper reads the EID through it when
+  SELinux allows the call (permissive, or as root), and falls back cleanly with telephony's own answer when it doesn't.
+  Not yet on a real phone or a real HAL.
+
+This changes the Android access route only; it does not rewrite the card's access rules, patch Android or defeat the
+operator's own profile authentication.
+
+Android 17 QPR2's emulator image (CP41) adds the calling package to `iccTransmitApduLogicalChannelByPort`, after the
+slot and port; the helper matches that form too and passes `com.android.shell`. That argument is the calling package:
+telephony checks it belongs to the caller (`com.android.shell` passes for shell and for root, another name throws).
+Android 17 as released (CE2A) still has the older form. On that QPR2 image telephony also refuses shell every standard
+ISD-R identifier, the partial and the lower-case one included: it normalises the ID before comparing it, where CE2A
+compares the exact upper-case text only. So there telephony can't reach a standard card at all. It is a pre-release
+image; whether phones get the same is unknown.
 
 Complete card operations are serialized on one process-wide thread. Installs and switches run under a short foreground
 service and a capped wake lock (`CardWork`), so leaving the app can't cut one off midway. A lost connection aborts the
@@ -427,7 +460,7 @@ showing it as the card, until someone confirms it's their removable card. The pa
 still required on the tested phone because its telephony service restricts the
 full standard identifier to the system LPA; the lower-case full identifier and the Secure Element HAL route above are
 fallbacks for phones where the partial one or telephony itself won't do, and neither has been confirmed on a real
-phone yet.
+phone yet (the lower-case one doesn't help on Android 17 QPR2's emulator image, see above).
 
 ### Several cards
 
