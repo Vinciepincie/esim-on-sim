@@ -79,8 +79,29 @@ public final class CardShell implements HelperServer.Session {
 
     /** The Secure Element AIDL HAL (android.hardware.secure_element.ISecureElement) a slot is reached through when the
      * phone's own telephony won't give the card up: its reader for a slot, or null when the phone has none the helper's
-     * user may reach. Looked up once per slot (see {@link #secureElement}). */
+     * user may reach. Remembered once found; a slot with none, or whose HAL refused the helper, is asked again after
+     * {@link #HAL_RETRY_MS} (see {@link #secureElement}). */
     interface SecureElement { Object reader(int slot) throws Exception; }
+
+    /** The slot's Secure Element HAL process went away, and every channel it had open with it. */
+    static final class HalGoneException extends IllegalStateException {
+        HalGoneException() { super("The card's secure element service went away"); }
+    }
+
+    /** Milliseconds that only ever go forward: when to look for the Secure Element HAL again. */
+    interface Clock { long millis(); }
+
+    /** How long a Secure Element HAL that wasn't there, or refused the helper, is left alone before it's asked again:
+     * the phone's own secure-element app may not have been up yet, and a helper can run for days. */
+    static final long HAL_RETRY_MS = 60_000;
+    private static final String HAL = "android.hardware.secure_element.ISecureElement";
+    /** Android's own secure-element app, which brings the HAL's Java interface with it. */
+    private static final String SE_PACKAGE = "com.android.se";
+    /** PackageManager.MATCH_SYSTEM_ONLY: an app installed later under the same name never counts. */
+    private static final long MATCH_SYSTEM_ONLY = 0x00100000;
+    /** An APK on one of Android's read-only partitions, the only place the helper loads code from. */
+    private static final Pattern SYSTEM_APK =
+            Pattern.compile("/(system|system_ext|product|vendor|odm|apex)/[A-Za-z0-9_.@+-]+(/[A-Za-z0-9_.@+-]+)*\\.apk");
 
     /** Runs [check] on a thread of its own every [ms], at most [times] times, until it returns true. */
     interface Repeat { void every(long ms, int times, Callable<Boolean> check); }
@@ -93,14 +114,19 @@ public final class CardShell implements HelperServer.Session {
     private final Class<?> requestType;
     private final Class<?> subApi;
     private final Callable<Object> subs;
-    /** The Secure Element HAL interface for reflection, or null where the phone has no such AIDL HAL (before Android 11,
-     * or not declared). {@link #se} finds each slot's reader. */
-    private final Class<?> seApi;
+    /** Gives the Secure Element HAL's interface for reflection, or null where the phone has no such AIDL HAL (before
+     * Android 14, or not declared). Asked only once telephony misses: see {@link #seApi()}. {@link #se} finds each
+     * slot's reader. */
+    private final Callable<Class<?>> seApis;
     private final SecureElement se;
-    /** A slot's Secure Element reader once {@link #secureElement} found one, and the slots it found none for: either way
-     * the lookup happens once. */
+    private final Clock clock;
+    /** The HAL's interface once found, and when to look for it again while it isn't. */
+    private Class<?> seApi;
+    private long seApiRetry = Long.MIN_VALUE;
+    /** A slot's Secure Element reader once {@link #secureElement} found one, and until when the slots it found none for
+     * (or whose HAL refused the helper) are left alone. */
     private final Map<Integer, Object> seReaders = new HashMap<>();
-    private final java.util.Set<Integer> seAbsent = new java.util.HashSet<>();
+    private final Map<Integer, Long> seAbsent = new HashMap<>();
     private final Commands commands;
     /** Android's API level. */
     private final int sdk;
@@ -111,6 +137,8 @@ public final class CardShell implements HelperServer.Session {
     private final Method open, transmit, close;
     /** Android 13+ transmits by slot and port; earlier versions only reach port 0. */
     private final boolean byPort;
+    /** Android 17 QPR2's transmit by port also takes the calling package, after the slot and port. */
+    private final boolean transmitNamesCaller;
     private final Map<String, Channel> channels = new HashMap<>();
     private Object phone;
     private Object sub;
@@ -120,22 +148,24 @@ public final class CardShell implements HelperServer.Session {
         this(Class.forName(TELEPHONY + "ITelephony"), () -> service("phone", "ITelephony", "Telephony"),
                 optionalClass(TELEPHONY + "IccLogicalChannelRequest"), Class.forName(TELEPHONY + "ISub"),
                 () -> service("isub", "ISub", "Subscription"), CardShell::exec, Build.VERSION.SDK_INT,
-                CardShell::inBackground, secureElementApi(), CardShell::secureElementReader);
+                CardShell::inBackground, CardShell::secureElementApi, CardShell::secureElementReader,
+                android.os.SystemClock::elapsedRealtime);
     }
 
     /** [phones] gives what implements [api] and [subs] what implements [subApi], once they're needed, and again after
-     * the phone process restarted. [seApi] is the Secure Element HAL interface (null where there is none) and [se]
-     * gives a slot's reader. Tests pass stand-ins with the methods of Android version [sdk], and run [repeat]'s
-     * checks themselves. */
+     * the phone process restarted. [seApis] gives the Secure Element HAL interface (null where there is none) and [se]
+     * a slot's reader, both only once telephony misses. Tests pass stand-ins with the methods of Android version [sdk],
+     * run [repeat]'s checks themselves, and move [clock] by hand. */
     CardShell(Class<?> api, Callable<Object> phones, Class<?> requestType, Class<?> subApi, Callable<Object> subs,
-              Commands commands, int sdk, Repeat repeat, Class<?> seApi, SecureElement se) {
+              Commands commands, int sdk, Repeat repeat, Callable<Class<?>> seApis, SecureElement se, Clock clock) {
         this.api = api;
         this.phones = phones;
         this.requestType = requestType;
         this.subApi = subApi;
         this.subs = subs;
-        this.seApi = seApi;
+        this.seApis = seApis;
         this.se = se;
+        this.clock = clock;
         this.commands = commands;
         this.sdk = sdk;
         this.repeat = repeat;
@@ -145,6 +175,8 @@ public final class CardShell implements HelperServer.Session {
         Method[] found = null;
         if (requestType != null) { // Android 13+
             Method t = find(api, "iccTransmitApduLogicalChannelByPort", I, I, I, I, I, I, I, I, S);
+            // Android 17 QPR2 adds the calling package after the slot and port.
+            if (t == null) t = find(api, "iccTransmitApduLogicalChannelByPort", I, I, S, I, I, I, I, I, I, S);
             if (t == null) t = find(api, "iccTransmitApduLogicalChannelBySlot", I, I, I, I, I, I, I, S);
             found = all(find(api, "iccOpenLogicalChannel", requestType), t,
                     find(api, "iccCloseLogicalChannel", requestType));
@@ -174,7 +206,9 @@ public final class CardShell implements HelperServer.Session {
         open = found == null ? null : found[0];
         transmit = found == null ? null : found[1];
         close = found == null ? null : found[2];
-        byPort = route == Route.REQUEST && transmit.getParameterTypes().length == 9;
+        int transmitArgs = transmit == null ? 0 : transmit.getParameterTypes().length;
+        byPort = route == Route.REQUEST && transmitArgs >= 9;
+        transmitNamesCaller = route == Route.REQUEST && transmitArgs == 10;
     }
 
     public static void main(String[] args) {
@@ -279,13 +313,23 @@ public final class CardShell implements HelperServer.Session {
         if (op.equals("open")) {
             String aid = q.getString("aid");
             if (!ISD_R_AIDS.contains(aid)) throw new IllegalArgumentException("Unsupported card applet");
-            // Telephony first; the Secure Element HAL only where telephony won't give the card up (no channel, or this
-            // phone has no telephony channel calls at all). A card no telephony route reaches can still answer there.
-            Opened t = route == null ? null : openViaTelephony(slot, port, aid);
+            // Telephony first; the Secure Element HAL only where telephony won't give the card up: no channel, telephony
+            // refusing the helper outright (a ROM that keeps these calls from it), or no telephony channel calls at all.
+            Opened t = null;
+            Exception refused = null;
+            if (route != null) {
+                try { t = openViaTelephony(slot, port, aid); }
+                catch (Exception e) {
+                    if (phoneDied(e)) throw e; // its channels went with it: handle() starts over, no HAL detour
+                    refused = e;
+                }
+            }
             if (t != null && t.channel > 0) { storeTelephony(slot, port, t); return t.json(out); }
             Opened s = openViaSecureElement(slot, aid);
             if (s != null && s.channel > 0) { storeSecureElement(slot, port, s); return s.json(out); }
-            // No channel either way: telephony's status is the more informative one when there was a route.
+            // No channel either way: telephony's answer is the more informative one when there was a route, and the
+            // app tells a refusal, or a slot past the phone's last, by telephony's exception.
+            if (refused != null) throw refused;
             if (t != null) return t.json(out);
             if (s != null) return s.json(out);
             throw new UnsupportedOperationException("This phone has no known way to reach the card");
@@ -297,7 +341,7 @@ public final class CardShell implements HelperServer.Session {
         if (op.equals("close")) {
             // Forget it even when closing fails: after a card restart the channel no longer exists.
             try {
-                if (owned.seHal != null) call(seApi, owned.seHal, "closeChannel", (byte) channel);
+                if (owned.seHal != null) halCall(slot, owned.seHal, "closeChannel", (byte) channel);
                 else closeChannel(slot, port, channel, owned);
             } finally { channels.remove(key); }
             return out;
@@ -313,9 +357,18 @@ public final class CardShell implements HelperServer.Session {
         if (owned.seHal != null) {
             // The HAL sends the APDU straight to the card, so the channel goes in the class byte here, the way Android's
             // own secure-element service sets it (ISO 7816-4). Telephony takes the channel as its own argument instead.
-            byte[] answer = (byte[]) call(seApi, owned.seHal, "transmit",
-                    (Object) apdu(channel, cla, ins, p1, p2, p3, data));
+            byte[] answer;
+            try { answer = (byte[]) halCall(slot, owned.seHal, "transmit", (Object) apdu(channel, cla, ins, p1, p2, p3, data)); }
+            catch (Exception e) {
+                // The HAL's process restarting takes its channels with it, and the number can go to another of its
+                // users, Android's own secure-element app among them: forgotten, so nothing here closes that one later.
+                // Any other failure keeps it, so the app's close gives it back, as Android's own secure-element app does.
+                if (e instanceof HalGoneException) channels.remove(key);
+                throw e;
+            }
             if (answer == null || answer.length < 2) throw new IllegalStateException("The card gave no answer");
+            // 6881: the card says this channel isn't open, as after it restarted. Forgotten too, for the same reason.
+            if (answer[answer.length - 2] == 0x68 && answer[answer.length - 1] == (byte) 0x81) channels.remove(key);
             return out.put("response", hex(answer));
         }
         Object result = transmit.invoke(phone(),
@@ -396,27 +449,31 @@ public final class CardShell implements HelperServer.Session {
 
     /** Opens [aid] on [slot] through the Secure Element HAL, where the phone has one the helper's user may reach. The
      * HAL opens the logical channel and selects the applet in one call, below the OMAPI app check telephony enforces.
-     * Never inits or resets the HAL: it is shared with Android's own secure-element service and other apps' channels.
-     * Returns null where there is no such HAL, or it couldn't give the card up, so telephony's own answer stands. */
-    private Opened openViaSecureElement(int slot, String aid) throws Exception {
+     * Never inits or resets the HAL: it is shared with Android's own secure-element service and other apps' channels,
+     * and works only once that service has set it up. Returns null where there is no such HAL, or it couldn't give the
+     * card up, so telephony's own answer stands. */
+    private Opened openViaSecureElement(int slot, String aid) {
         Object hal = secureElement(slot);
         if (hal == null) return null;
         try {
-            Boolean present = (Boolean) call(seApi, hal, "isCardPresent");
+            Boolean present = (Boolean) halCall(slot, hal, "isCardPresent");
             if (present != null && !present) return Opened.missing();
-            Object response = call(seApi, hal, "openLogicalChannel", bytes(aid), (byte) 0);
+            Object response = halCall(slot, hal, "openLogicalChannel", bytes(aid), (byte) 0);
             if (response == null) return null;
             int ch = ((Number) response.getClass().getField("channelNumber").get(response)).intValue() & 0xFF;
-            if (ch <= 0) return Opened.missing();
+            if (ch == 0) return Opened.missing();
+            if (ch > 19) {
+                // The HAL promises 1-19, the channels a class byte can name: any other is given back unused.
+                try { halCall(slot, hal, "closeChannel", (byte) ch); } catch (Exception ignored) { }
+                return null;
+            }
             Opened o = new Opened();
             o.channel = ch;
             o.select = hex((byte[]) response.getClass().getField("selectResponse").get(response));
             o.seHal = hal;
             return o;
         } catch (Exception e) {
-            // No such applet, no free channel, or the HAL went away: leave telephony's answer to stand. Drop a dead
-            // reader so the next open looks the HAL up again.
-            if (phoneDied(e)) seReaders.remove(slot);
+            // No such applet, no free channel, or the HAL refused or went away (see halCall): telephony's answer stands.
             return null;
         }
     }
@@ -425,16 +482,55 @@ public final class CardShell implements HelperServer.Session {
         channels.put(slot + ":" + port + ":" + o.channel, new Channel(null, -1, o.seHal));
     }
 
+    /** The HAL's interface, looked up the first time telephony misses, so a phone telephony serves never pays for it.
+     * Where it can't be found it's looked for again after {@link #HAL_RETRY_MS}. */
+    private Class<?> seApi() {
+        if (seApi != null || seApis == null) return seApi;
+        long now = clock.millis();
+        if (now < seApiRetry) return null;
+        try { seApi = seApis.call(); } catch (Throwable t) { seApi = null; } // a missing class is an Error
+        if (seApi == null) seApiRetry = now + HAL_RETRY_MS;
+        return seApi;
+    }
+
     /** The Secure Element HAL reader for [slot], found once and remembered; null where the phone has none the helper's
-     * user may reach, so later opens on that slot don't look again. */
+     * user may reach, and then not looked for again on that slot for {@link #HAL_RETRY_MS}. */
     private Object secureElement(int slot) {
-        if (se == null || seApi == null || slot < 0 || seAbsent.contains(slot)) return null;
+        if (se == null || slot < 0 || seApi() == null) return null;
         Object hal = seReaders.get(slot);
         if (hal != null) return hal;
-        try { hal = se.reader(slot); } catch (Exception e) { hal = null; }
-        if (hal == null) { seAbsent.add(slot); return null; }
+        long now = clock.millis();
+        Long retry = seAbsent.get(slot);
+        if (retry != null && now < retry) return null;
+        try { hal = se.reader(slot); } catch (Throwable t) { hal = null; }
+        if (hal == null) { seAbsent.put(slot, now + HAL_RETRY_MS); return null; }
+        seAbsent.remove(slot);
         seReaders.put(slot, hal);
         return hal;
+    }
+
+    /** A call into [slot]'s Secure Element HAL. Java gives a DeadObjectException both when that HAL's process went
+     * away and when SELinux keeps the helper's user from calling it (the usual case for ADB shell: it may look the HAL
+     * up, not call it), the same exception as for the phone process dying. So it's said as something else, which
+     * {@link #handle} doesn't take for the phone process, whose channels would go with it. The two are told apart by
+     * the HAL's binder: dead after its process went, when the next open looks it up afresh; alive after a refusal,
+     * when that slot's HAL is left alone for {@link #HAL_RETRY_MS}. */
+    private Object halCall(int slot, Object hal, String name, Object... args) throws Exception {
+        try { return call(seApi, hal, name, args); }
+        catch (Exception e) {
+            if (!phoneDied(e)) throw e;
+            seReaders.remove(slot);
+            if (!binderAlive(hal)) throw new HalGoneException();
+            seAbsent.put(slot, clock.millis() + HAL_RETRY_MS);
+            throw new IllegalStateException("The card's secure element service refused this helper");
+        }
+    }
+
+    /** Whether [hal]'s binder is still alive. Where that can't be told, it's taken for alive: a refusal, the case
+     * that keeps the helper from asking again at once. */
+    private static boolean binderAlive(Object hal) {
+        try { return ((IBinder) hal.getClass().getMethod("asBinder").invoke(hal)).isBinderAlive(); }
+        catch (Exception e) { return true; }
     }
 
     /** The APDU bytes for the Secure Element HAL: header and data, with the logical channel in the class byte. */
@@ -717,13 +813,14 @@ public final class CardShell implements HelperServer.Session {
         throw new NoSuchMethodException(name);
     }
 
-    /** Whether [arg] can be passed as [type]: the primitives used are int, boolean and (the Secure Element HAL's) byte.
-     * A byte[] is an object, so {@link Class#isInstance} already covers it. */
+    /** Whether [arg] can be passed as [type]: the primitives used are int, boolean, (the Secure Element HAL's) byte and
+     * (the package manager's) long. A byte[] is an object, so {@link Class#isInstance} already covers it. */
     private static boolean fits(Class<?> type, Object arg) {
         if (arg == null) return !type.isPrimitive();
         if (type == int.class) return arg instanceof Integer;
         if (type == boolean.class) return arg instanceof Boolean;
         if (type == byte.class) return arg instanceof Byte;
+        if (type == long.class) return arg instanceof Long;
         return type.isInstance(arg);
     }
 
@@ -751,28 +848,74 @@ public final class CardShell implements HelperServer.Session {
         return proxy;
     }
 
-    /** The Secure Element AIDL HAL interface, or null before Android 11 (where the HAL isn't this shape) or where the
-     * phone doesn't have it. Looked up before chaining to the constructor, so the helper never reflects on a class
-     * that isn't there. */
-    private static Class<?> secureElementApi() {
-        if (Build.VERSION.SDK_INT < 30) return null;
-        return optionalClass("android.hardware.secure_element.ISecureElement");
+    /** Where the HAL's interface was loaded from, once it has been: the same for every session of this process. */
+    private static volatile ClassLoader halLoader;
+
+    /** The Secure Element AIDL HAL interface, or null where the phone has none: before Android 14, which has only the
+     * older HIDL one, or no secure-element app. The interface isn't among the classes every process has: it comes in
+     * Android's own secure-element app (com.android.se), so it's loaded from that app's APK, found through the package
+     * manager rather than by starting a command. Only ever from a read-only system partition (see [systemApk]). */
+    static Class<?> secureElementApi() throws Exception {
+        if (Build.VERSION.SDK_INT < 34) return null;
+        ClassLoader loader = halLoader;
+        if (loader == null) {
+            String apk = systemApk(appPath(SE_PACKAGE));
+            if (apk == null) return null;
+            loader = new dalvik.system.PathClassLoader(apk, CardShell.class.getClassLoader());
+        }
+        Class<?> api = Class.forName(HAL, true, loader); // throws where this phone's app has no AIDL HAL interface
+        halLoader = loader;
+        return api;
+    }
+
+    /** Where the system package [name]'s APK is, as the package manager says; null where there's no such system package. */
+    private static String appPath(String name) throws Exception {
+        IBinder binder = (IBinder) Class.forName("android.os.ServiceManager")
+                .getMethod("getService", String.class).invoke(null, "package");
+        if (binder == null) return null;
+        Class<?> api = Class.forName("android.content.pm.IPackageManager");
+        Object pm = Class.forName("android.content.pm.IPackageManager$Stub")
+                .getMethod("asInterface", IBinder.class).invoke(null, binder);
+        Object info = call(api, pm, "getApplicationInfo", name, MATCH_SYSTEM_ONLY, 0); // Android 13+: flags are a long
+        return info == null ? null : (String) info.getClass().getField("sourceDir").get(info);
+    }
+
+    /** [path], resolved, when it's an APK on one of Android's read-only partitions; otherwise null. The helper runs as
+     * shell or root, so it never loads code from anywhere an app could write: an updated copy in /data doesn't count. */
+    static String systemApk(String path) {
+        if (path == null) return null;
+        try {
+            java.io.File file = new java.io.File(path);
+            return acceptedApk(file.getCanonicalPath(), file.isFile()); // /system_ext, say, can be a link into /system
+        } catch (java.io.IOException e) {
+            return null;
+        }
+    }
+
+    /** [real], a resolved path, when it's an APK on a read-only partition and [isFile] says it's there; else null. */
+    static String acceptedApk(String real, boolean isFile) {
+        return isFile && onSystemPartition(real) ? real : null;
+    }
+
+    /** Whether [path] names an APK on one of Android's read-only partitions, with no ".." or "." in it. */
+    static boolean onSystemPartition(String path) {
+        if (!SYSTEM_APK.matcher(path).matches()) return false;
+        for (String part : path.split("/")) if (part.equals("..") || part.equals(".")) return false;
+        return true;
     }
 
     /** The Secure Element HAL for a physical [slot] (SIM1 for slot 0, SIM2 for slot 1, ...), or null where none is
-     * declared or the helper's user may not reach it. Non-blocking: a HAL that isn't up is treated as absent, so
-     * discovery never waits on one. */
-    private static Object secureElementReader(int slot) {
-        try {
-            String instance = "android.hardware.secure_element.ISecureElement/SIM" + (slot + 1);
-            IBinder binder = (IBinder) Class.forName("android.os.ServiceManager")
-                    .getMethod("getService", String.class).invoke(null, instance);
-            if (binder == null) return null;
-            return Class.forName("android.hardware.secure_element.ISecureElement$Stub")
-                    .getMethod("asInterface", IBinder.class).invoke(null, binder);
-        } catch (Throwable t) {
-            return null;
-        }
+     * registered. Android doesn't say how a HAL's numbers match the slots: this is its own secure-element app's order,
+     * SIM1 first. Non-blocking, and never starts a HAL: one that isn't up counts as absent, so discovery never waits on
+     * it. A HAL the helper's user may look up but not call is found here, and refuses at the first call. */
+    private static Object secureElementReader(int slot) throws Exception {
+        Class<?> api = secureElementApi();
+        if (api == null) return null;
+        IBinder binder = (IBinder) Class.forName("android.os.ServiceManager")
+                .getMethod("getService", String.class).invoke(null, HAL + "/SIM" + (slot + 1));
+        if (binder == null) return null;
+        return Class.forName(HAL + "$Stub", true, api.getClassLoader())
+                .getMethod("asInterface", IBinder.class).invoke(null, binder);
     }
 
     /** Runs [command] as this helper's user, with its error output mixed in. */
@@ -800,7 +943,9 @@ public final class CardShell implements HelperServer.Session {
         switch (route) {
             case SUB: return new Object[] {c.subId};
             case DEFAULT: return new Object[0];
-            default: return byPort ? new Object[] {slot, port} : new Object[] {slot};
+            default:
+                if (!byPort) return new Object[] {slot};
+                return transmitNamesCaller ? new Object[] {slot, port, SHELL} : new Object[] {slot, port};
         }
     }
 
