@@ -3,6 +3,7 @@ package com.esimonsim.adb
 import android.os.DeadObjectException
 import android.os.IBinder
 import com.esimonsim.apdu.ApduException
+import com.esimonsim.lpa.Hex
 import com.esimonsim.lpa.Lpa
 import org.json.JSONArray
 import org.json.JSONObject
@@ -105,7 +106,8 @@ class CardShellTest {
         Phone26::class.java to 26, Phone27::class.java to 27, Phone28::class.java to 28, Phone29::class.java to 29,
         Phone31::class.java to 31)
 
-    private fun shell(api: Class<*>, subApi: Class<*> = Sub23::class.java, request: Class<*>? = null) = CardShell(
+    private fun shell(api: Class<*>, subApi: Class<*> = Sub23::class.java, request: Class<*>? = null,
+                      seApi: Class<*>? = null, se: CardShell.SecureElement = CardShell.SecureElement { _ -> null }) = CardShell(
         api, {
             if (telephonyDown) throw IllegalStateException("Telephony service unavailable")
             phoneFetches++
@@ -120,7 +122,36 @@ class CardShellTest {
             else settings[command[3]] ?: "null"
         },
         sdks[api] ?: 33,
-    ) { ms, times, check -> watches += Watch(ms, times, check) }
+        { ms, times, check -> watches += Watch(ms, times, check) },
+        seApi, se,
+    )
+
+    /** A stand-in for the Secure Element HAL: one card, answering channels from [channelNumber]. */
+    private inner class FakeSe : InvocationHandler {
+        val calls = ArrayList<Call>()
+        var present = true
+        var channelNumber: Byte = 1
+        var selectResponse: ByteArray? = byteArrayOf(0x90.toByte(), 0)
+        var transmitReply: ByteArray? = byteArrayOf(0x90.toByte(), 0)
+        var openFailure: Exception? = null
+        override fun invoke(proxy: Any, method: Method, args: Array<out Any?>?): Any? {
+            calls += Call(signature(method), args?.toList().orEmpty())
+            return when (method.name) {
+                "isCardPresent" -> present
+                "openLogicalChannel" -> { openFailure?.let { throw it }; SeResponse(channelNumber, selectResponse) }
+                "transmit" -> transmitReply
+                else -> null // closeChannel
+            }
+        }
+    }
+
+    private val secure = FakeSe()
+
+    /** A reader that hands [secure] out for the given slots and nothing for others. */
+    private fun seReaderFor(vararg slots: Int) = CardShell.SecureElement { slot ->
+        if (slot in slots) Proxy.newProxyInstance(javaClass.classLoader, arrayOf(SecureElementApi::class.java), secure)
+        else null
+    }
 
     private fun android13() = shell(Phone33::class.java, Sub30::class.java, Request::class.java)
 
@@ -325,10 +356,93 @@ class CardShellTest {
 
     @Test fun everyEsimManagerIdOpensAndNoOther() {
         assertEquals(Lpa.ISD_R_OPEN, CardShell.ISD_R_AIDS[0])
+        // The last is the whole standard ID in lower case: a fallback for a card that won't take the prefix.
+        assertEquals(Lpa.ISD_R_LOWER, CardShell.ISD_R_AIDS.last())
         val shell = shell(Phone29::class.java)
         for (aid in CardShell.ISD_R_AIDS) assertTrue(aid, shell.open(0, aid = aid).getInt("channel") > 0)
-        // The whole standard ID is direct access's: the helper has no use for it.
+        // The whole standard ID in upper case is direct access's and is reserved for the system LPA: the helper won't
+        // send it, so the Android 13+ check never sees this app ask for it. The lower-case form above is sent instead.
         assertThrows(IllegalArgumentException::class.java) { shell.open(0, aid = Lpa.ISD_R) }
+    }
+
+    @Test fun theClassByteCarriesTheLogicalChannel() {
+        // ISO 7816-4, as Android's own secure-element service encodes it. Channels 0-3 in the low two bits.
+        assertEquals(0x80.toByte(), CardShell.classByte(0x80, 0)) // ES10 STORE DATA, channel 0
+        assertEquals(0x81.toByte(), CardShell.classByte(0x80, 1))
+        assertEquals(0x83.toByte(), CardShell.classByte(0x80, 3))
+        assertEquals(0x01.toByte(), CardShell.classByte(0x00, 1)) // GET RESPONSE on channel 1
+        // Channels 4-19: bit 7 set, (channel - 4) in the low nibble.
+        assertEquals(0x40.toByte(), CardShell.classByte(0x00, 4))
+        assertEquals(0x4F.toByte(), CardShell.classByte(0x00, 19))
+        assertThrows(IllegalArgumentException::class.java) { CardShell.classByte(0x00, 20) }
+    }
+
+    @Test fun theSecureElementHalReachesACardTelephonyCannot() {
+        // A phone with no telephony channel calls at all: the Secure Element HAL is the only way in.
+        val shell = shell(PhoneUnknown::class.java, seApi = SecureElementApi::class.java, se = seReaderFor(1))
+        val opened = shell.open(1)
+        assertEquals(1, opened.getInt("channel"))
+        assertEquals(0, opened.getInt("status"))
+        assertEquals("9000", opened.getString("select"))
+        assertEquals(listOf("isCardPresent()", "openLogicalChannel(byte[],byte)"), secure.calls.map { it.method })
+        // The AID went in as bytes; the prefix is selected with P2 = first occurrence.
+        assertEquals(Lpa.ISD_R_OPEN, Hex.encode(secure.calls[1].args[0] as ByteArray))
+        assertEquals(0.toByte(), secure.calls[1].args[1])
+        // The card's bytes come back as hex (byte-level APDU shape is checked in the next test).
+        assertEquals("9000", shell.transmit(1, 1).getString("response"))
+    }
+
+    @Test fun aSecureElementChannelTransmitsThroughTheClassByteAndCloses() {
+        val shell = shell(PhoneUnknown::class.java, seApi = SecureElementApi::class.java, se = seReaderFor(1))
+        shell.open(1)
+        shell.transmit(1, 1) // GetEID: cla 0x80, ins 0xE2, p1 0x91, p2 0, p3 6, data BF3E035C015A
+        val sent = secure.calls.single { it.method.startsWith("transmit") }.args.single() as ByteArray
+        assertEquals("81E2910006BF3E035C015A", Hex.encode(sent)) // class byte 0x80 | channel 1 = 0x81, then the APDU
+        secure.calls.clear()
+        shell.close(1, 1)
+        assertEquals(listOf("closeChannel(byte)"), secure.calls.map { it.method })
+        assertEquals(1.toByte(), secure.calls.single().args.single())
+    }
+
+    @Test fun telephonyWinsAndTheSecureElementHalIsNotConsulted() {
+        val shell = shell(Phone29::class.java, seApi = SecureElementApi::class.java, se = seReaderFor(0, 1))
+        assertEquals(1, shell.open(1).getInt("channel"))
+        assertTrue(secure.calls.isEmpty())
+    }
+
+    @Test fun theSecureElementHalFallsInBehindATelephonyMiss() {
+        // Android 8.1-9 can't reach slot 1 without an active subscription; the HAL still can.
+        val shell = shell(Phone27::class.java, seApi = SecureElementApi::class.java, se = seReaderFor(1))
+        val opened = shell.open(1)
+        assertEquals(1, opened.getInt("channel"))
+        assertTrue(phone.calls.isEmpty()) // telephony never opened: no subscription for that slot
+        assertTrue(secure.calls.any { it.method.startsWith("openLogicalChannel") })
+    }
+
+    @Test fun aSecureElementHalWithNoCardReportsAnEmptySlot() {
+        secure.present = false
+        val shell = shell(PhoneUnknown::class.java, seApi = SecureElementApi::class.java, se = seReaderFor(1))
+        val opened = shell.open(1)
+        assertEquals(0, opened.getInt("channel"))
+        assertEquals(2, opened.getInt("status"))
+        assertTrue(secure.calls.none { it.method.startsWith("openLogicalChannel") }) // isCardPresent said no first
+    }
+
+    @Test fun aSlotWithNoSecureElementReaderIsNotRetried() {
+        val shell = shell(PhoneUnknown::class.java, seApi = SecureElementApi::class.java, se = seReaderFor(1))
+        // Slot 0 has no reader: an unreachable phone still says so, and the reader is asked for only once.
+        assertThrows(UnsupportedOperationException::class.java) { shell.open(0) }
+        assertThrows(UnsupportedOperationException::class.java) { shell.open(0) }
+        assertTrue(secure.calls.isEmpty())
+    }
+
+    @Test fun endingASessionClosesSecureElementChannels() {
+        val shell = shell(PhoneUnknown::class.java, seApi = SecureElementApi::class.java, se = seReaderFor(1))
+        shell.open(1)
+        secure.calls.clear()
+        shell.close()
+        assertEquals(listOf("closeChannel(byte)"), secure.calls.map { it.method })
+        assertEquals(1.toByte(), secure.calls.single().args.single())
     }
 
     @Test fun onlyTheCardManagerAndEs10AreAllowed() {
@@ -695,6 +809,18 @@ class CardShellTest {
 
     /** SubscriptionInfo. */
     class SubInfo(val subscriptionId: Int, val iccId: String)
+
+    /** android.hardware.secure_element.ISecureElement: the few methods the helper's fallback route uses. byte and
+     *  byte[] match the AIDL HAL, so the helper's reflection picks them the same way it does on a real phone. */
+    interface SecureElementApi {
+        fun isCardPresent(): Boolean
+        fun openLogicalChannel(aid: ByteArray?, p2: Byte): SeResponse?
+        fun transmit(apdu: ByteArray?): ByteArray?
+        fun closeChannel(channel: Byte)
+    }
+
+    /** android.hardware.secure_element.LogicalChannelResponse: public fields the helper reads by name. */
+    class SeResponse(@JvmField val channelNumber: Byte, @JvmField val selectResponse: ByteArray?)
 
     /** UiccSlotInfo on Android 9: no isRemovable() yet. */
     class Slot9(private val euicc: Boolean) { fun getIsEuicc() = euicc }
