@@ -29,8 +29,8 @@ android {
         // Android 17: finding Wireless debugging's ports over mDNS needs the Nearby devices permission (asked
         // for just before pairing or connecting); the loopback connections themselves don't.
         targetSdk = 37
-        versionCode = 4
-        versionName = "0.4"
+        versionCode = 5
+        versionName = "0.5"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         // Phones only: skip the x86/x86_64 copies of the native libs (emulators, Chromebooks).
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }

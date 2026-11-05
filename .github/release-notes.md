@@ -1,10 +1,11 @@
 ## What's new
 
-- **Two eSIM cards:** with both in your phone, switch between them at the top of the app.
-- **Settings:** choose how the app reaches your card, and pick a light or dark look.
-- **Safer installs:** the app double-checks with your card that a new eSIM really went on.
-- **Clearer messages** when a provider or your card says no, so you know whether to try again.
-- **Licences** for the parts the app is built on, under About.
+- **More cards through root, Shizuku, and Wireless or USB debugging.** If one of these couldn't open your card before, the app now tries two more things before it gives up:
+  - It asks for the card's eSIM manager by its full ID, for cards that don't answer to the shorter one the app normally uses.
+  - On Android 14 and newer, it can also try the phone's SIM reader directly. That may work on rooted phones, and on a few phones without root. Not every phone has it.
+- **Nothing changes where the app already works.** The app only tries these after the usual steps, so a card that opened before opens the same way. There's nothing new to choose under Card access.
+
+These two tries haven't been tested on a real phone yet. If this version gets your card working, or it still won't open, please [tell us how it went](https://github.com/{{repo}}/issues). Say which Android version your phone has and how the app reaches your card: root, Shizuku, or Wireless or USB debugging.
 
 ## Download
 
