@@ -121,8 +121,11 @@ class OmapiApduBackend internal constructor(flagLocked: () -> Boolean = { true }
         val all = readers ?: throw ApduException("Card access disconnected. Reconnect first.")
         if (port != 0) throw ApduException("This phone has no SIM ports.")
         if (slot !in all.slots) return OpenResult(0, STATUS_MISSING, null) // no reader there, so no card either
-        // The makers' IDs are for the helper: here the card's own ID comes from [AIDS], below and in [connect].
-        if (!aidHex.equals(Lpa.ISD_R_OPEN, ignoreCase = true) && !aidHex.equals(Lpa.ISD_R, ignoreCase = true))
+        // The makers' IDs and the lower-case copy of the standard one are for the helper: here the card's own ID comes
+        // from [AIDS], below and in [connect]. Lpa asks for the lower-case copy after the others, so letting it through
+        // would ask an ordinary SIM for every ID a second time.
+        if (aidHex == Lpa.ISD_R_LOWER ||
+            (!aidHex.equals(Lpa.ISD_R_OPEN, ignoreCase = true) && !aidHex.equals(Lpa.ISD_R, ignoreCase = true)))
             return OpenResult(0, STATUS_MISSING, null)
         // Access rules name the eSIM manager's full ID, so the shorter one the helper selects with won't match them.
         val aid = aids[slot] ?: ISD_R
@@ -284,8 +287,11 @@ class OmapiApduBackend internal constructor(flagLocked: () -> Boolean = { true }
         private const val SE_SERVICE = "com.android.se.SecureElementService"
         private val ISD_R = Hex.decode(Lpa.ISD_R)
         /** The standard eSIM manager first, then the IDs some adapter cards use instead, as OpenEUICC tries them
-         *  (eSIM.me, 5ber, XeSIM, LinksField, ESTKme). Access rules can let apps into one and not another. */
-        private val AIDS = (listOf(Lpa.ISD_R) + CardShell.ISD_R_AIDS.drop(1)).map(Hex::decode)
+         *  (eSIM.me, 5ber, XeSIM, LinksField, ESTKme). Access rules can let apps into one and not another. Each ID once:
+         *  the helper's lower-case copy of the standard one ([Lpa.ISD_R_LOWER]) is only for telephony's text check, and
+         *  to a card reader it's the same ID again, another check of the card's access rules for nothing. */
+        private val AIDS = (listOf(Lpa.ISD_R) + CardShell.ISD_R_AIDS.drop(1)).map { it.uppercase() }.distinct()
+            .map(Hex::decode)
         /** As telephony reports an applet that isn't there (IccOpenLogicalChannelResponse.STATUS_NO_SUCH_ELEMENT). */
         private const val STATUS_MISSING = 3
 

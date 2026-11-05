@@ -369,7 +369,7 @@ LinksField, ESTKme; the list is `CardShell.ISD_R_AIDS`), so a standard card neve
 tries. The last ID in that list is the whole standard ISD-R AID in lower case (`Lpa.ISD_R_LOWER`), tried behind all of
 them: a card that won't take the 15-byte prefix still selects ISD-R from the full ID, and the lower case still slips past
 the Android 13+ telephony check that keeps the exact upper-case ID for the system LPA (it compares as text). A card that
-takes the prefix keeps using it, as the prefix wins first. `OmapiApduBackend` opens the full ISD-R AID, or a maker's ID when only that one is allowed. Each
+takes the prefix keeps using it, as the prefix wins first. `OmapiApduBackend` opens the full ISD-R AID, or a maker's ID when only that one is allowed. It leaves the lower-case copy out: to a card reader that's the same ID again. Each
 try makes Android check the card's access rules on the card (tens of ms), so cards that
 refused every AID are remembered by ATR and skipped at later starts (Reconnect asks
 them again). Not the ATR of the card that let the app in: two cards of one make share it, and one may refuse where the
@@ -405,7 +405,7 @@ input ends.
 
 The helper reaches the card through the phone's telephony first (the calls above), and falls back to the **Secure Element
 HAL** (`android.hardware.secure_element.ISecureElement`, the AIDL HAL, Android 14+; 11-13 have only the older HIDL one,
-which the helper doesn't use) when telephony gives no channel for a slot, refuses the helper outright (it throws, as for an
+which the helper doesn't use, and a phone updated to 14 or later may still have only that one) when telephony gives no channel for a slot, refuses the helper outright (it throws, as for an
 ID it keeps for the system LPA), or the phone has none of telephony's channel calls at all. When the HAL can't help either,
 telephony's own answer or exception goes back to the app unchanged, so its messages stay the same. The HAL is the layer
 below both telephony and Android's own OMAPI service: a card the phone's telephony won't open can still answer there,

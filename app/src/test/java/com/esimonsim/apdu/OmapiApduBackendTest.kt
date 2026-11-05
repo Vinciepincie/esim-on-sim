@@ -83,6 +83,28 @@ class OmapiApduBackendTest {
         assertTrue(readers.opened.isEmpty())
     }
 
+    @Test fun noSlotIsAskedForTheSameIdTwice() {
+        // The card taken out, so the search goes through every ID on every slot. It ends with the helper's lower-case
+        // copy of the standard ID, which to a reader is the ID the ordinary SIM already said no to.
+        val cards = mutableMapOf(0 to FakeCard.ORDINARY, 1 to FakeCard.OPEN)
+        val real = FakeReaders(cards)
+        val asked = ArrayList<Pair<Int, String>>()
+        val readers = object : OmapiApduBackend.Readers by real {
+            override fun openChannel(slot: Int, aid: ByteArray): OmapiApduBackend.SeChannel {
+                asked += slot to Hex.encode(aid)
+                return real.openChannel(slot, aid)
+            }
+        }
+        val backend = OmapiApduBackend { readers }
+        backend.connect()
+        assertEquals(asked.distinct(), asked)
+        cards[1] = FakeCard.EMPTY
+        asked.clear()
+        runCatching { Lpa(backend).discover() }
+        assertTrue(asked.any { it.first == 0 })
+        assertEquals(asked.distinct(), asked)
+    }
+
     @Test fun anotherMakesCardIsFoundWithoutConnectingAgain() {
         val esimMe = "A0000005591010000000008900000300"
         val readers = FakeReaders(mapOf(1 to FakeCard.OPEN)) { "BF3E125A10${eid}9000" }
