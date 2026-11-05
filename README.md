@@ -25,8 +25,9 @@ eSIMs on the card.
 These cards all follow the same GSMA standard. If you try another card, please
 [tell us how it went](https://github.com/Vinciepincie/esim-on-sim/issues).
 
-> **Disclaimer:** I've only tested this app on my own phone with a 5ber card, and with simulations on virtual machines. It
-> should work on other phones and cards, but I can't guarantee it. Use it at your own risk.
+> **Disclaimer:** I've only tested this app on my own phone with a 5ber card, and with simulations on virtual machines.
+> There have, however, been several user reports of other cards and phones working correctly. It should work on other
+> phones and cards, but I can't guarantee it. Use it at your own risk.
 
 ## Why use it
 
