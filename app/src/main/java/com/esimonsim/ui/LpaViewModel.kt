@@ -31,6 +31,7 @@ import com.esimonsim.data.ProfileStore
 import com.esimonsim.es9.Es9Client
 import com.esimonsim.lpa.ActivationCode
 import com.esimonsim.lpa.AlreadyOnCardException
+import com.esimonsim.lpa.CardFacts
 import com.esimonsim.lpa.ConfirmationCodeNeededException
 import com.esimonsim.lpa.EuiccProfile
 import com.esimonsim.lpa.Lpa
@@ -140,6 +141,8 @@ data class LpaUi(
     val builtInChip: String? = null,
     /** With [builtInChip]: another slot holds a card the phone isn't using, likely the one people are looking for. */
     val idleSlot: Int = -1,
+    /** With [builtInChip]: another slot holds an eSIM card that didn't answer just now (see [Lpa.quietSlot]). */
+    val quietSlot: Int = -1,
     /** Active profile first. */
     val profiles: List<EuiccProfile> = emptyList(),
     /** Notes saved on this phone, by ICCID. */
@@ -154,6 +157,8 @@ data class LpaUi(
     val details: String? = null,
     /** Free space and versions, read when Details opens. */
     val cardInfo: Lpa.CardInfo? = null,
+    /** The card's own name as last remembered, shown until [cardInfo] has the one read now. */
+    val knownCardName: CardFacts.Name? = null,
     val cardInfoLoading: Boolean = false,
     /** Shown inline during setup; with [errorTitle] set, shown as a dialog instead. */
     val error: String? = null,
@@ -802,7 +807,7 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
             _ui.update { it.copy(eid = null, slot = -1, profiles = emptyList(), details = null, waiting = null, cardInfo = null) }
         }
         val stay = refreshStays(lpa.card?.eid, store.chosenCard(), _ui.value.manageable)
-        _ui.update { it.copy(loading = true, error = null, errorTitle = null, builtInChip = null, idleSlot = -1) }
+        _ui.update { it.copy(loading = true, error = null, errorTitle = null, builtInChip = null, idleSlot = -1, quietSlot = -1) }
         val card = if (stay) lpa else lpa.again()
         viewModelScope.launch {
             try {
@@ -831,7 +836,7 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
                 if (profiles == null) {
                     _ui.update { it.copy(loading = false, eid = null, slot = -1, profiles = emptyList(), details = null,
                         waiting = null, adding = false, keepDraft = it.keepDraft || it.adding, installed = null,
-                        duplicate = null, builtInChip = shown.card?.eid, idleSlot = shown.idleSlot) }
+                        duplicate = null, builtInChip = shown.card?.eid, idleSlot = shown.idleSlot, quietSlot = shown.quietSlot) }
                     return@launch
                 }
                 show(shown, profiles, done)
@@ -861,6 +866,7 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
     /** [card], just read, is the one in view now. The card it replaces may just have stopped answering: it stays known. */
     private fun show(card: Lpa, profiles: List<EuiccProfile>, done: String?) {
         val eid = card.card?.eid ?: return
+        store.addSeenOnCard(eid, profiles.map { it.iccid }) // so a deleted one is never taken for the card's own name
         val ui = _ui.value
         ui.eid?.takeIf { it != eid }?.let { kept = kept + (it to Kept(lpa, ui.profiles)) }
         // One slot holds one card: one there before was taken out for this one.
@@ -869,7 +875,7 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
         _ui.update { it.copy(loading = false, eid = eid, slot = card.slot, profiles = profiles, info = done ?: it.info,
             // The number goes with the slot: a card put in another one has another.
             sim = simOf[card.slot] ?: -1,
-            cardInfo = it.cardInfo.takeIf { _ -> it.eid == eid }) }
+            cardInfo = it.cardInfo.takeIf { _ -> it.eid == eid }, knownCardName = store.cardName(eid)) }
     }
 
     /** Puts [eid] in view: at once if its list is known, while it's read again. On a card already in view, the form's
@@ -889,7 +895,7 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
         lpa = next.lpa
         store.chooseCard(eid)
         _ui.update { it.copy(eid = eid.takeIf { _ -> next.profiles != null }, slot = next.lpa.slot, profiles = next.profiles.orEmpty(),
-            sim = simOf[next.lpa.slot] ?: -1, cards = it.rows, cardInfo = null, waiting = null,
+            sim = simOf[next.lpa.slot] ?: -1, cards = it.rows, cardInfo = null, knownCardName = store.cardName(eid), waiting = null,
             details = null, addTarget = if (it.adding) eid else it.addTarget) }
         loadCard()
     }
@@ -958,7 +964,10 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
         Log.i("LpaViewModel", "Looked for cards: " + looks.joinToString { "${it.slot}=${it.what}" })
         for (l in looks) {
             when (l.what) {
-                SlotLook.What.CARD -> l.card?.let { kept = kept + (it.eid to Kept(lpa.at(it), l.profiles?.activeFirst())) }
+                SlotLook.What.CARD -> l.card?.let {
+                    kept = kept + (it.eid to Kept(lpa.at(it), l.profiles?.activeFirst()))
+                    l.profiles?.let { list -> store.addSeenOnCard(it.eid, list.map { p -> p.iccid }) }
+                }
                 SlotLook.What.EMPTY, SlotLook.What.IDLE, SlotLook.What.LOCKED -> kept = kept.filterValues { it.lpa.slot != l.slot }
                 SlotLook.What.HUNG -> hungSlots = hungSlots + l.slot
                 else -> { }
@@ -1220,20 +1229,50 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
         if (_ui.value.access != AccessStatus.READY) return
         _ui.update { it.copy(cardInfoLoading = true) }
         val card = lpa // outside the gate on changing card: the sheet can be closed and another card picked meanwhile
+        val iccids = _ui.value.profiles.map { it.iccid }
         viewModelScope.launch {
             val r = try {
                 withContext(cardDispatcher) {
                     backend.reading {
                         // Asked apart: a card that won't say its addresses still shows its other details.
                         val (defaultDp, rootDs) = runCatching { card.configuredAddresses() }.getOrDefault(null to null)
-                        card.cardInfo().copy(rootDs = rootDs, defaultDp = defaultDp)
+                        card.cardInfo().copy(rootDs = rootDs, defaultDp = defaultDp, name = cardName(card, iccids))
                     }
                 }
             } catch (e: CancellationException) { throw e } catch (_: Exception) { null }
             // By EID, not object: a refresh meanwhile gives the same card a new one.
             val same = card.card?.eid?.let { it == lpa.card?.eid } == true
-            _ui.update { it.copy(cardInfoLoading = false, cardInfo = r.takeIf { _ -> same } ?: it.cardInfo) }
+            _ui.update { it.copy(cardInfoLoading = false, cardInfo = r.takeIf { _ -> same } ?: it.cardInfo,
+                knownCardName = if (r != null && same) r.name else it.knownCardName) }
         }
+    }
+
+    /** The card's own name ([CardFacts.name]), remembered per card for when the helper can't read Android's records.
+     *  A new name replaces a remembered one only if at least as sure; a remembered one is dropped once its profile
+     *  turns out to be one of the card's eSIMs ([iccids], or seen before). */
+    private fun cardName(card: Lpa, iccids: List<String>): CardFacts.Name? {
+        val found = card.card ?: return null
+        val records = runCatching { backend.cardRecords(found.eid) }.getOrDefault(emptyList())
+        var esims = iccids + store.seenOnCard(found.eid)
+        var named = CardFacts.name(records, esims, found.isdR)
+        // Only a profile in use can be an eSIM turned on in another app since the list on screen was read: then the
+        // card's list is read again, so that eSIM isn't taken for the card's own profile.
+        // Where that read fails, a profile in use proves nothing, so none counts.
+        if (named?.from == CardFacts.Name.From.IN_USE) {
+            val now = runCatching { card.getProfiles().map { it.iccid } }.getOrNull()
+            if (now != null) store.addSeenOnCard(found.eid, now)
+            esims = (now ?: iccids) + store.seenOnCard(found.eid)
+            named = CardFacts.name(if (now != null) records else records.filter { !it.inUse }, esims, found.isdR)
+        }
+        val stored = store.cardName(found.eid)
+        val kept = stored?.takeUnless { k -> k.iccid?.let { CardFacts.isEsim(it, esims) } == true }
+        val best = when {
+            named == null -> kept
+            kept == null || named.from.ordinal <= kept.from.ordinal -> named
+            else -> kept
+        }
+        if (best != stored) store.setCardName(found.eid, best)
+        return best
     }
 
     fun openDetails(p: EuiccProfile) = _ui.update { it.copy(details = p.iccid) }
@@ -1373,6 +1412,8 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
                     val added = profiles?.firstOrNull { it.isdpAid !in known }
                     // In here: this block still ends if people swiped the app away, and what follows it doesn't run then.
                     store.recordInstall(ac, added?.iccid ?: outcome.iccid, added?.displayName ?: outcome.profileName)
+                    // One of the card's eSIMs, even if the list couldn't be read: never the card's own name.
+                    lpa.card?.eid?.let { eid -> (added?.iccid ?: outcome.iccid)?.let { store.addSeenOnCard(eid, listOf(it)) } }
                     // An eSIM hidden once and removed elsewhere (another phone or app) can come back: it shows like any new one.
                     (added?.iccid ?: outcome.iccid)?.let { store.setHidden(it, false) }
                     Triple(outcome, profiles, added)
@@ -1479,6 +1520,7 @@ class LpaViewModel(app: Application, private val saved: SavedStateHandle) : Andr
                     backend.reconnect() // Wireless debugging is normally still on: just the link dropped
                 }
                 val list = lpa.getProfiles().activeFirst()
+                lpa.card?.eid?.let { store.addSeenOnCard(it, list.map { p -> p.iccid }) }
                 if (confirmed(list)) return list
                 _ui.update { it.copy(profiles = list) }
                 last = ApduException("The card didn't confirm the change. Refresh to check its current state.")

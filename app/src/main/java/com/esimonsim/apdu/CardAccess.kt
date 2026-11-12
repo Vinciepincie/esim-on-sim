@@ -531,6 +531,9 @@ class CardAccess internal constructor(
 
     override fun openChannel(slot: Int, port: Int, aidHex: String) = current().openChannel(slot, port, aidHex)
 
+    override fun openChannelViaSecureElement(slot: Int, port: Int, reader: Int, aidHex: String) =
+        current().openChannelViaSecureElement(slot, port, reader, aidHex)
+
     override fun transmit(slot: Int, port: Int, channel: Int, cla: Int, ins: Int, p1: Int, p2: Int, p3: Int, dataHex: String) =
         current().transmit(slot, port, channel, cla, ins, p1, p2, p3, dataHex)
 
@@ -539,6 +542,8 @@ class CardAccess internal constructor(
     override fun slots(): List<SlotInfo> = current().slots()
 
     override fun present(slot: Int): Boolean? = current().present(slot)
+
+    override fun cardRecords(eid: String): List<SimRecord> = current().cardRecords(eid)
 
     /** Runs [block], which only reads the card, with shorter time limits (see [AdbApduBackend.reading]). */
     fun <T> reading(block: () -> T): T = adb.reading { root.reading { shizuku.reading(block) } }

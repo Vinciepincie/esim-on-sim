@@ -167,7 +167,16 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
     data class CardInfo(val freeBytes: Long?, val installedApps: Int?, val standard: String? = null,
                         val firmware: String? = null, val roots: List<String> = emptyList(),
                         /** From [configuredAddresses]: the card's discovery server and default provider. */
-                        val rootDs: String? = null, val defaultDp: String? = null) {
+                        val rootDs: String? = null, val defaultDp: String? = null,
+                        /** Free volatile memory: the card chip's own RAM that's free, in bytes. */
+                        val freeRam: Long? = null,
+                        /** The GSMA accreditation number of the factory that made the chip (SAS-UP), such as
+                         *  "ED-ZI-UP-0824": its first letters name the maker ([CardFacts.maker]). */
+                        val factory: String? = null,
+                        /** euiccCategory: 1 basic, 2 medium, 3 contactless; 0 "other" and absent both say nothing. */
+                        val category: Int? = null,
+                        /** The name the card gives itself, and where it came from: see [CardFacts.name]. */
+                        val name: CardFacts.Name? = null) {
         /** Who issued each root, once each; unlisted ones by the start of their key ID. */
         val rootNames: List<String> get() = roots.map { ROOT_NAMES[it] ?: "Unknown ${it.take(8)}" }.distinct()
     }
@@ -197,21 +206,34 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
     var onBuiltInSlot = false; private set
     /** A card that isn't the one [discover] found, in a slot the phone isn't using, if the phone said so. */
     var idleSlot = -1; private set
+    /** With the phone's own chip found ([onBuiltInSlot]): another slot Android says holds an eSIM card in use, which gave
+     *  telephony no card this time (busy, restarting, an error), not just "no such applet". Likely the card people are
+     *  looking for, not answering for now; -1 if none. */
+    var quietSlot = -1; private set
     /** The card this object works on, once [discover] found it or [at] said which. */
     private var eid: String? = null
     /** The eSIM manager ID that card answered to: one of [CardShell.ISD_R_AIDS]. */
     private var isdR = ISD_R_OPEN
+    /** The Secure Element HAL reader that card answered on (0 for SIM1), or -1 where telephony reaches it. */
+    private var reader = -1
+    /** Set by [again] for a card that answered on a Secure Element HAL reader: [discover] asks there first. */
+    private var viaReader: Card? = null
 
     /** The card this object works on, with where it answers; null before [discover] found one. */
-    val card: Card? get() = eid?.let { Card(it, slot, isdR, onBuiltInSlot) }
+    val card: Card? get() = eid?.let { Card(it, slot, isdR, onBuiltInSlot, reader) }
 
     /** An object of its own for [card]. Each card has one, so an operation stays on its card whatever is in view. */
     fun at(card: Card) = sibling().also {
         it.slot = card.slot; it.isdR = card.isdR; it.eid = card.eid; it.onBuiltInSlot = card.builtIn
+        it.reader = card.reader
     }
 
     /** A new object to [discover] with, which starts where this one found its card, so a refresh costs what it did. */
-    fun again(sameSlot: Boolean = true) = sibling().also { if (sameSlot) it.slot = slot; it.isdR = isdR }
+    fun again(sameSlot: Boolean = true) = sibling().also {
+        if (sameSlot) it.slot = slot
+        it.isdR = isdR
+        if (sameSlot && reader >= 0) it.viaReader = card
+    }
 
     private fun sibling() = Lpa(backend, phoneHasEsim, slotReach, transport, accessRulesApply)
 
@@ -222,6 +244,9 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
      *  the card's own slot that way too: [onBuiltInSlot] lets the app ask. It asks as well when the list can't be
      *  read (Android 9 without root, or the phone process just restarted): whatever answers then could be the chip. */
     fun discover(): String {
+        quietSlot = -1
+        // A card found through a reader last time: tried there first, as that card (by EID).
+        viaReader?.let { known -> viaReader = null; againViaReader(known)?.let { return it } }
         val reported = if (phoneHasEsim) runCatching { backend.slots() }.getOrDefault(emptyList()) else emptyList()
         val builtIn = reported.withIndex().filter { (_, s) -> s.euicc && !s.removable }.mapTo(HashSet()) { it.index }
         val unknown = phoneHasEsim && reported.isEmpty() && !accessRulesApply()
@@ -243,37 +268,76 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
             listOf(others, builtInSlots).flatMap { group -> ids.flatMap { id -> group.map { it to id } } }).distinct()
         val noCard = HashSet<Int>()
         val lockedSlots = HashSet<Int>() // eSIM cards that refuse this way in
+        val failedSlots = HashSet<Int>() // a card there opened through telephony, then failed
+        val noManager = HashSet<Int>() // telephony said "no such applet" there, and only that, this time
+        val answered = HashSet<Int>() // telephony said something else there: a channel, another status, an error
+        val busy = HashSet<Int>() // no free channel there, or an unknown error: a card that may answer in a moment
         for ((s, id) in tries) {
             if (s in noCard) continue
             try {
                 val r = backend.openChannel(s, 0, id)
                 Log.i(TAG, "slot $s openChannel -> channel=${r.channel} status=${r.status}")
                 cardAnswered = true
+                if (r.channel <= 0 && r.status == 3) noManager += s else answered += s
+                if (r.channel <= 0 && (r.status == 2 || r.status == 4)) busy += s
                 if (r.channel > 0) {
                     // isdR only once the EID has been read: a maker's ID may select something that's no eSIM manager.
-                    try {
+                    val found = try {
                         slot = s; port = 0
-                        return readEid(r.channel).also {
-                            eid = it; isdR = id; onBuiltInSlot = unknown || s in builtIn
-                            idleSlot = reported.withIndex().firstOrNull { (i, o) ->
-                                i != s && o.euicc && o.present != false && o.active == false }?.index ?: -1
-                        }
+                        readEid(r.channel)
                     } catch (e: Throwable) {
                         slot = lastSlot // sendEs10 needs it set; a list still on screen belongs to the last one
-                        if (cardFailure == null && s !in builtIn) cardFailure = e
+                        if (s !in builtIn) { failedSlots += s; if (cardFailure == null) cardFailure = e }
                         throw e
                     } finally { backend.closeChannel(s, 0, r.channel) }
+                    // Only the phone's own (unconfirmed) chip: a tray card only a reader reaches goes first. The chip's
+                    // EID is known now, so it can't pass for that card. Ordinary SIMs are skipped (cost at every refresh).
+                    if (s in builtIn && s != slotHint && backend.isReady()) {
+                        val ordinarySim = reported.withIndex().filter { (i, o) ->
+                            !o.euicc && o.present == true && i in noManager && i !in answered }.mapTo(HashSet()) { it.index }
+                        val tray = try {
+                            viaSecureElement(tries.filter { it.first !in builtIn && it.first !in ordinarySim }, reported,
+                                builtIn, unknown, known = mapOf(s to found), quiet = true)
+                        } catch (e: Exception) { if (!backend.isReady()) throw e else null }
+                        if (tray != null) return tray
+                        slot = s; port = 0
+                    }
+                    eid = found; isdR = id; reader = -1; onBuiltInSlot = unknown || s in builtIn
+                    idleSlot = idleBesides(s, reported)
+                    if (s in builtIn) quietSlot = quietBesides(builtIn, reported, busy + failedSlots)
+                    return found
                 }
                 if (r.status == 2) noCard += s // no card, or a slot this Android can't reach
                 if (r.status == OpenResult.LOCKED) lockedSlots += s
                 errors.append("slot$s:status=${r.status} ")
             } catch (e: Throwable) {
+                if (!backend.isReady()) throw e // the link went: say so now, not as an earlier slot's error
+                answered += s
                 if (failure == null) failure = e
                 if (cardFailure == null && s !in builtIn && (e as? ApduException)?.cardThere == true) cardFailure = e
                 errors.append("slot$s:${e.message} ")
             }
         }
-        cardFailure?.let { throw it }
+        cardFailure?.let { e ->
+            // The card failed through telephony: try its reader, accepting only that card. Otherwise its error stands.
+            if (backend.isReady() && failedSlots.isNotEmpty()) {
+                val eid0 = eid; val isdR0 = isdR; val reader0 = reader; val builtIn0 = onBuiltInSlot; val idle0 = idleSlot
+                val whole = try { viaSecureElement(tries.filter { it.first in failedSlots }, reported, builtIn, unknown, quiet = true) }
+                    catch (x: Exception) { if (!backend.isReady()) throw x else null }
+                if (whole != null && !onBuiltInSlot && slot in failedSlots &&
+                    (reported.getOrNull(slot)?.eid.equals(whole, ignoreCase = true) || failedSlots.size == 1)) return whole
+                if (whole != null) { // another card: put back what this object had
+                    slot = lastSlot; eid = eid0; isdR = isdR0; reader = reader0; onBuiltInSlot = builtIn0; idleSlot = idle0
+                }
+            }
+            throw e
+        }
+        // No card through telephony: try the Secure Element HAL readers. Only now, never ahead of telephony (issue #1:
+        // 0.5 asked a reader on each miss and read a Pixel's own chip as the card).
+        if (backend.isReady()) viaSecureElement(tries, reported, builtIn, unknown)?.let {
+            if (slot in builtIn) quietSlot = quietBesides(builtIn, reported, busy + failedSlots)
+            return it
+        }
         // Every slot threw, or the link went partway: the connection to the card is the problem, not a missing card.
         // Not any slot that threw: slots past the phone's last do, on Android 10+.
         if (failure != null && (!cardAnswered || !backend.isReady())) throw failure
@@ -286,6 +350,114 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
             SlotReach.FIRST_ONLY -> NOT_FOUND_FIRST_ONLY
         })
     }
+
+    /** [discover]'s search through the Secure Element HAL readers. Android doesn't say which card a reader reaches, so:
+     *  readers by SIM number ([SlotInfo.logical]) first, then by slot number as a guess ([alone]); empty or unused slots
+     *  skipped; a card whose EID belongs to another slot rejected ([fitsSlot]); a possible built-in chip flagged
+     *  ([onBuiltInSlot]). [known]: EIDs already read through telephony. Returns the EID or null; a lost link throws, and
+     *  so does a failing card unless [quiet]. */
+    private fun viaSecureElement(tries: List<Pair<Int, String>>, reported: List<SlotInfo>, builtIn: Set<Int>,
+                                 unknown: Boolean, known: Map<Int, String> = emptyMap(), quiet: Boolean = false): String? {
+        val slots = reported.ifEmpty { runCatching { backend.slots() }.getOrDefault(emptyList()) }.mapIndexed { i, o ->
+            known[i]?.takeIf { o.eid == null }?.let { SlotInfo(o.euicc, o.removable, o.present, o.active, o.logical, it, o.token) } ?: o
+        }
+        val bySimNumber = tries.mapNotNull { (s, id) -> slots.getOrNull(s)?.logical?.let { Triple(s, id, it) } }
+        val bySlot = tries.filter { (s, _) -> slots.getOrNull(s)?.logical != s }.map { (s, id) -> Triple(s, id, s) }
+        val lastSlot = slot
+        val noReader = HashSet<Int>() // no such reader, no card in it, or it refused the helper
+        val errors = HashMap<Int, Int>() // by reader: one error can be a passing one, a second writes it off
+        val otherCard = HashSet<Pair<Int, Int>>() // slot, reader: it reached a card that isn't that slot's
+        var cardFailure: Exception? = null // a card there that failed, by its SIM number: goes before "not found"
+        for ((s, id, n) in bySimNumber + bySlot) {
+            val info = slots.getOrNull(s)
+            if (info == null && slots.isNotEmpty()) continue // no such slot (no SIM3 on a two-slot phone)
+            if (info?.present == false || info?.active == false || n in noReader || (s to n) in otherCard) continue
+            val r = try { backend.openChannelViaSecureElement(s, 0, n, id) } catch (e: Exception) {
+                if (!backend.isReady()) throw e // card access went: said as such, not as "no card"
+                errors[n] = (errors[n] ?: 0) + 1
+                if (errors.getValue(n) >= 2) noReader += n
+                continue
+            }
+            if (r.channel <= 0) { if (r.status == 2) noReader += n; continue }
+            val found = try {
+                slot = s; port = 0 // sendEs10 needs it set
+                try { readEid(r.channel) } catch (e: Exception) {
+                    if (!backend.isReady()) { slot = lastSlot; throw e }
+                    Log.w(TAG, "slot $s: the card on Secure Element reader SIM${n + 1} failed: ${e.message}")
+                    if (cardFailure == null && s !in builtIn && info?.logical == n) cardFailure = e
+                    null
+                }
+            } finally { backend.closeChannel(s, 0, r.channel) }
+            val guess = info?.logical != n
+            if (found != null && fitsSlot(s, found, slots) && (!guess || alone(s, found, slots))) {
+                val confirmed = info?.eid.equals(found, ignoreCase = true)
+                // A built-in chip without an EID from Android could be what this reader reaches (with one, fitsSlot decided).
+                val maybeChip = !confirmed && builtIn.any { j -> j != s && slots.getOrNull(j)?.eid == null }
+                Log.i(TAG, "slot $s: card found through Secure Element reader SIM${n + 1}")
+                eid = found; isdR = id; reader = n; onBuiltInSlot = unknown || s in builtIn || maybeChip
+                idleSlot = idleBesides(s, reported)
+                return found
+            }
+            if (found != null) {
+                Log.w(TAG, "slot $s: Secure Element reader SIM${n + 1} reaches a card that isn't that slot's")
+                otherCard += s to n
+            }
+            slot = lastSlot
+        }
+        slot = lastSlot
+        if (!quiet) cardFailure?.let { throw it } // the card is there: what went wrong with it says more than "not found"
+        return null
+    }
+
+    /** [discover]'s first try for [known], a card found through a reader last time: same reader and ID, accepted only if
+     *  the same EID answers and Android's slot list still fits (slot in use, no other slot's EID or SIM number). Null
+     *  otherwise, and the full search runs. */
+    private fun againViaReader(known: Card): String? {
+        val lastSlot = slot
+        val r = try { backend.openChannelViaSecureElement(known.slot, 0, known.reader, known.isdR) } catch (e: Exception) {
+            if (!backend.isReady()) throw e
+            return null
+        }
+        if (r.channel <= 0) return null
+        val found = try {
+            slot = known.slot; port = 0 // sendEs10 needs it set
+            runCatching { readEid(r.channel) }.getOrNull()
+        } finally { backend.closeChannel(known.slot, 0, r.channel) }
+        val slots = runCatching { backend.slots() }.getOrDefault(emptyList())
+        val info = slots.getOrNull(known.slot)
+        val stays = found != null && found.equals(known.eid, ignoreCase = true) &&
+            info?.present != false && info?.active != false && fitsSlot(known.slot, found, slots) &&
+            (info?.logical == known.reader || slots.withIndex().none { (i, o) ->
+                i != known.slot && o.present != false && o.active == true && o.logical == known.reader })
+        if (!stays) { slot = lastSlot; return null }
+        Log.i(TAG, "slot ${known.slot}: card found again through Secure Element reader SIM${known.reader + 1}")
+        eid = found; isdR = known.isdR; reader = known.reader; onBuiltInSlot = known.builtIn
+        idleSlot = idleBesides(known.slot, if (phoneHasEsim) slots else emptyList())
+        return found
+    }
+
+    /** Whether the card with EID [found], reached through a Secure Element HAL reader, can be slot [s]'s: Android gives
+     *  no other slot that EID, nor this one another. Where Android gives no EIDs, this can't be told, and it passes. */
+    private fun fitsSlot(s: Int, found: String, slots: List<SlotInfo>) =
+        slots.withIndex().none { (i, o) -> i != s && o.eid.equals(found, ignoreCase = true) } &&
+            slots.getOrNull(s)?.eid.let { it == null || it.equals(found, ignoreCase = true) }
+
+    /** Whether a card found through a reader guessed from slot [s]'s own number can only be that slot's: Android gives
+     *  the slot that EID, or has no other SIM in use that the reader could be reaching instead. */
+    private fun alone(s: Int, found: String, slots: List<SlotInfo>) =
+        slots.getOrNull(s)?.eid.equals(found, ignoreCase = true) ||
+            slots.withIndex().none { (i, o) -> i != s && o.present != false && o.active == true }
+
+    /** [quietSlot]: a non-built-in slot with an eSIM card in use (per Android) that telephony found [busy] this time.
+     *  Refusals don't count: trying again wouldn't help. -1 if none. */
+    private fun quietBesides(builtIn: Set<Int>, reported: List<SlotInfo>, busy: Set<Int>) =
+        reported.withIndex().firstOrNull { (i, o) ->
+            i !in builtIn && i in busy && o.euicc && o.present == true && o.active != false
+        }?.index ?: -1
+
+    /** A slot other than [s] with an eSIM card the phone isn't using, if [reported] says so; -1 if not. */
+    private fun idleBesides(s: Int, reported: List<SlotInfo>) = reported.withIndex().firstOrNull { (i, o) ->
+        i != s && o.euicc && o.present != false && o.active == false }?.index ?: -1
 
     /** Looks through the phone's slots for cards besides the one in [inView]: read here, on the channel that gave the
      *  EID, so a card nobody's looking at shows up with its eSIMs for one command more. Costs the card nothing for a slot
@@ -300,7 +472,19 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
         if (slotReach() == SlotReach.FIRST_ONLY) return emptyList() // only ever one card to reach
         val reported = runCatching { backend.slots() }.getOrDefault(emptyList())
         val unknown = phoneHasEsim && reported.isEmpty() && !accessRulesApply()
+        val builtIn = if (!phoneHasEsim) emptySet()
+            else reported.withIndex().filter { (_, o) -> o.euicc && !o.removable }.mapTo(HashSet()) { it.index }
+        // Cards known to be elsewhere: the one in view (unless its slot is empty now: it may have moved) and those found.
+        val elsewhere = HashSet<String>().apply {
+            if (reported.getOrNull(inView)?.present != false) eid?.let(::add)
+        }
         val looks = ArrayList<SlotLook>()
+        // Slots telephony found nothing in or refused: asked through readers after telephony has done every slot, so a
+        // reader can't claim a card telephony finds in a later slot.
+        class ForReaders(val at: Int, val s: Int, val info: SlotInfo?, val chip: Boolean, val tel: SlotLook?)
+        val forReaders = ArrayList<ForReaders>()
+        fun SlotLook.kept(info: SlotInfo?, keep: Boolean = true) =
+            SlotLook(slot, what, card, profiles, info?.logical, info?.token.takeIf { keep }, noManager)
         for (s in if (reported.isEmpty()) 0..3 else reported.indices) {
             if (!go()) break
             val info = reported.getOrNull(s)
@@ -309,10 +493,7 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
             val chip = unknown || (phoneHasEsim && info != null && info.euicc && !info.removable)
             // [keep] false: decided from Android's list alone, so the token isn't one to skip the slot by next time. A
             // slot turned on keeps its token, and asking Android again costs nothing.
-            fun look(what: SlotLook.What, found: Card? = null, list: List<EuiccProfile>? = null, noManager: Boolean = false,
-                     keep: Boolean = true) {
-                looks += SlotLook(s, what, found, list, info?.logical, token.takeIf { keep }, noManager)
-            }
+            fun look(what: SlotLook.What, keep: Boolean = true) { looks += SlotLook(s, what).kept(info, keep) }
             when {
                 s == inView -> look(SlotLook.What.SAME)
                 // What Android is sure of costs nothing to ask, so it goes before anything that would skip the slot.
@@ -326,39 +507,136 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
                 // Card access went for some other reason: no slot is to blame for that.
                 !backend.isReady() -> return looks
                 else -> {
-                    val result = try { probe(s, info, chip, own) } catch (e: Exception) {
+                    val tel = try { telephonyLook(s, info, chip, own) } catch (e: Exception) {
                         Log.i(TAG, "slot $s: ${e.javaClass.simpleName}")
-                        SlotLook(s, SlotLook.What.AGAIN)
+                        null
                     }
                     // Card access went during this slot, also where reading its list failed quietly: this one's to blame.
                     if (!backend.isReady()) { look(SlotLook.What.HUNG); return looks }
-                    look(result.what, result.card, result.profiles, result.noManager)
+                    tel?.seen?.let(elsewhere::add)
+                    if (tel != null && !tel.nothing) looks += tel.look.kept(info)
+                    else {
+                        forReaders += ForReaders(looks.size, s, info, chip, tel?.look)
+                        looks += SlotLook(s, SlotLook.What.AGAIN).kept(info) // for now
+                    }
                 }
+            }
+        }
+        for ((i, p) in forReaders.withIndex()) {
+            if (!go() || !backend.isReady()) break // the rest stay to be looked at again
+            val found = try { secureElementLook(p.s, p.info, p.chip, own, reported, builtIn, elsewhere) } catch (e: Exception) {
+                Log.i(TAG, "slot ${p.s}: ${e.javaClass.simpleName}")
+                ReaderLook.UNSURE
+            }
+            if (!backend.isReady()) {
+                looks[p.at] = SlotLook(p.s, SlotLook.What.HUNG).kept(p.info)
+                forReaders.drop(i + 1).forEach { looks[it.at] = SlotLook(it.s, SlotLook.What.AGAIN).kept(it.info) }
+                return looks
+            }
+            val reached = found.look
+            reached?.card?.eid?.let(elsewhere::add)
+            val tel = p.tel
+            val ordinarySim = p.info?.let { it.token != null && !it.euicc } == true
+            looks[p.at] = when {
+                reached != null -> reached.kept(p.info)
+                // Telephony refused; its SIM-number reader found no eSIM manager: settled (marked if an ordinary SIM).
+                tel == null -> SlotLook(p.s, if (found == ReaderLook.NONE) SlotLook.What.EMPTY else SlotLook.What.AGAIN,
+                    noManager = found == ReaderLook.NONE && ordinarySim).kept(p.info)
+                // Telephony's "no eSIM manager" mark stands unless a reader answered but couldn't settle it.
+                found == ReaderLook.UNSURE -> SlotLook(p.s, tel.what).kept(p.info)
+                else -> tel.kept(p.info)
             }
         }
         return looks
     }
 
-    /** Opens [s] under each ID in turn until one answers, and reads the card behind it. */
-    private fun probe(s: Int, info: SlotInfo?, chip: Boolean, own: Set<String>): SlotLook {
+    /** [telephonyLook]'s answer: the [look], whether [nothing] card-like answered, and the EID of a chip it kept out. */
+    private class TelLook(val look: SlotLook, val nothing: Boolean, val seen: String? = null)
+
+    /** Telephony's look at slot [s], ID by ID. Refused IDs are passed over; throws if all were refused or the card failed. */
+    private fun telephonyLook(s: Int, info: SlotInfo?, chip: Boolean, own: Set<String>): TelLook {
         var noManager = info != null && info.token != null && !info.euicc
+        var refused: Exception? = null
         for (id in if (info?.token == null) listOf(ISD_R_OPEN) else CardShell.ISD_R_AIDS) {
-            val r = backend.openChannel(s, 0, id)
-            if (r.status == OpenResult.LOCKED) return SlotLook(s, SlotLook.What.LOCKED)
+            val r = try { backend.openChannel(s, 0, id) } catch (e: Exception) {
+                if (!backend.isReady()) throw e
+                if (refused == null) refused = e
+                noManager = false // a refusal says nothing about what's on the card
+                continue
+            }
+            if (r.status == OpenResult.LOCKED) return TelLook(SlotLook(s, SlotLook.What.LOCKED), false)
             if (r.channel > 0) try {
                 val card = at(Card("", s, id, chip))
                 val found = card.readEid(r.channel)
-                if (chip && found !in own) return SlotLook(s, SlotLook.What.EMPTY)
+                if (chip && found !in own) return TelLook(SlotLook(s, SlotLook.What.EMPTY), false, found)
                 // A card that won't list its eSIMs is still a card to switch to, where the failure gets said.
                 val list = runCatching { card.readProfiles(r.channel) }.getOrNull()
-                return SlotLook(s, SlotLook.What.CARD, Card(found, s, id, chip), list)
+                return TelLook(SlotLook(s, SlotLook.What.CARD, Card(found, s, id, chip), list), false, found)
             } finally { backend.closeChannel(s, 0, r.channel) }
             // No card, but also no free channel: with the list saying there is one, it's the card that's busy.
-            if (r.status == 2) return SlotLook(s, if (info != null && info.present == true && info.active == true)
-                SlotLook.What.AGAIN else SlotLook.What.EMPTY)
+            if (r.status == 2) return if (info != null && info.present == true && info.active == true)
+                TelLook(SlotLook(s, SlotLook.What.AGAIN), false) else TelLook(SlotLook(s, SlotLook.What.EMPTY), true)
             if (r.status != 3) noManager = false // only "no such applet" says there's none
         }
-        return SlotLook(s, SlotLook.What.EMPTY, noManager = noManager)
+        refused?.let { throw it }
+        return TelLook(SlotLook(s, SlotLook.What.EMPTY, noManager = noManager), true)
+    }
+
+    /** How [secureElementLook] ended: a [look] (a card, or a held-back chip); [NONE]: the SIM-number reader found no eSIM
+     *  manager; [NO_READER]: no reader (most phones); [UNSURE]: a reader answered but couldn't settle it. */
+    private class ReaderLook(val look: SlotLook?) {
+        companion object {
+            val NONE = ReaderLook(null)
+            val NO_READER = ReaderLook(null)
+            val UNSURE = ReaderLook(null)
+        }
+    }
+
+    /** [scan]'s reader look at slot [s], with [viaSecureElement]'s rules, plus: no card already known elsewhere
+     *  ([elsewhere]), and a possible chip only if people said it's theirs. The card keeps its reader. */
+    private fun secureElementLook(s: Int, info: SlotInfo?, chip: Boolean, own: Set<String>, slots: List<SlotInfo>,
+                                  builtIn: Set<Int>, elsewhere: Set<String>): ReaderLook {
+        val ids = if (info?.token == null) listOf(ISD_R_OPEN) else CardShell.ISD_R_AIDS
+        var unsure = false
+        readers@ for (n in listOfNotNull(info?.logical, s).distinct()) {
+            var errors = 0
+            var noApplet = 0
+            for (id in ids) {
+                val r = try { backend.openChannelViaSecureElement(s, 0, n, id) } catch (e: Exception) {
+                    if (!backend.isReady()) throw e
+                    unsure = true
+                    if (++errors >= 2) continue@readers else continue
+                }
+                if (r.channel <= 0) {
+                    if (r.status == 2) continue@readers
+                    if (r.status == 3) noApplet++ else unsure = true
+                    continue
+                }
+                try {
+                    val card = at(Card("", s, id, chip, n))
+                    val found = card.readEid(r.channel)
+                    val guess = info?.logical != n
+                    if (found in elsewhere || !fitsSlot(s, found, slots) || (guess && !alone(s, found, slots))) {
+                        Log.w(TAG, "slot $s: Secure Element reader SIM${n + 1} reaches a card that isn't that slot's")
+                        unsure = true
+                        continue@readers
+                    }
+                    val maybeChip = !info?.eid.equals(found, ignoreCase = true) &&
+                        builtIn.any { j -> j != s && slots.getOrNull(j)?.eid == null }
+                    if ((chip || maybeChip) && found !in own) return ReaderLook(SlotLook(s, SlotLook.What.EMPTY))
+                    val list = runCatching { card.readProfiles(r.channel) }.getOrNull()
+                    return ReaderLook(SlotLook(s, SlotLook.What.CARD, Card(found, s, id, chip || maybeChip, n), list))
+                } catch (e: Exception) {
+                    if (!backend.isReady()) throw e
+                    unsure = true
+                    continue@readers
+                } finally { backend.closeChannel(s, 0, r.channel) }
+            }
+            // The slot's reader by SIM number: something there, with no eSIM manager under any ID. The guess by slot
+            // number would only reach that again, or another slot's card.
+            if (n == info?.logical && noApplet == ids.size) return ReaderLook.NONE
+        }
+        return if (unsure) ReaderLook.UNSURE else ReaderLook.NO_READER
     }
 
     /** The card is outside SIM 1 where Android 7-9 reach it only through the SIM of an eSIM that's on. */
@@ -366,14 +644,20 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
 
     private inline fun <T> withIsdR(block: (Int) -> T): T {
         check(slot >= 0) { "call discover() first" }
-        val r = backend.openChannel(slot, port, isdR)
+        val r = if (reader >= 0) backend.openChannelViaSecureElement(slot, port, reader, isdR)
+            else backend.openChannel(slot, port, isdR)
         if (r.channel <= 0) throw ApduException(when {
             r.status == 2 && reachedOnlyWhileOn() -> OUT_OF_REACH
             // Direct access, and the card there now refuses it: swapped for another.
             r.status == OpenResult.LOCKED -> notFoundLocked(slot + 1)
             else -> "Couldn't open the card (status ${r.status}). Try again."
         })
-        try { return block(r.channel) } finally { backend.closeChannel(slot, port, r.channel) }
+        try {
+            // A Secure Element reader can come to reach another card, as when the phone numbers its SIMs anew: checked
+            // first, so nothing meant for this card goes to another.
+            if (reader >= 0 && eid != null && readEid(r.channel) != eid) throw ApduException(OTHER_CARD)
+            return block(r.channel)
+        } finally { backend.closeChannel(slot, port, r.channel) }
     }
 
     // ---------------- ES10 transport ----------------
@@ -473,8 +757,12 @@ class Lpa(private val backend: ApduBackend, private val phoneHasEsim: Boolean = 
         val resources = field(0x84)?.value?.let { Tlv.parseList(it) }.orEmpty()
         fun number(tag: Int) = resources.firstOrNull { it.tag == tag }?.value
             ?.takeIf { it.size in 1..8 }?.fold(0L) { n, b -> (n shl 8) or (b.toLong() and 0xFF) }
+        fun text(t: Tlv?) = t?.value?.let { utf8(it) }?.trim()?.takeIf { it.isNotEmpty() }
         CardInfo(freeBytes = number(0x82), installedApps = number(0x81)?.toInt(), standard = version(0x82),
-            firmware = version(0x83), roots = field(0xA9)?.children.orEmpty().map { Hex.encode(it.value) })
+            firmware = version(0x83), roots = field(0xA9)?.children.orEmpty().map { Hex.encode(it.value) },
+            freeRam = number(0x83), // extCardResource's free volatile memory
+            factory = text(field(0x0C)), // sasAcreditationNumber, a UTF8String with its universal tag
+            category = field(0x8B)?.value?.singleOrNull()?.toInt()?.takeIf { it in 1..3 })
     }
 
     /** The list on screen can be old: another card put in, or changes made in another app. A card numbers its

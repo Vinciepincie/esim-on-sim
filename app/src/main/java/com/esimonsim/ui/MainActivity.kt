@@ -64,6 +64,7 @@ import androidx.core.content.IntentCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.esimonsim.R
 import com.esimonsim.data.ProfileStore
+import com.esimonsim.lpa.CardFacts
 import com.esimonsim.lpa.EuiccProfile
 import com.esimonsim.lpa.Lpa
 import com.esimonsim.lpa.nameKey
@@ -367,7 +368,8 @@ private fun CardScreen(ui: LpaUi, vm: LpaViewModel, pad: PaddingValues, onCardAc
         Box(Modifier.padding(pad)) {
             when {
                 ui.loading -> Loading()
-                ui.builtInChip != null -> BuiltInChip(idle = ui.idleSlot >= 0, onRetry = vm::loadCard, onMine = vm::ownCard)
+                ui.builtInChip != null -> BuiltInChip(idle = ui.idleSlot >= 0, quiet = ui.quietSlot >= 0,
+                    onRetry = vm::loadCard, onMine = vm::ownCard)
                 else -> LoadFailed(ui.error, vm::loadCard,
                     Lpa.lockedSim(ui.error)?.let { sim -> { onCardAccess(sim - 1) } })
             }
@@ -667,10 +669,11 @@ private fun LoadFailed(error: String?, onRetry: () -> Unit, onCardAccess: (() ->
 }
 
 /** Only the phone's own chip answered, so nothing on it shows: to this app it would look like the user's card. [idle]:
- *  the phone isn't using a slot with another eSIM card in it, which is likely the removable one. Then saying this chip is
- *  it would be a mistake that hands Android's own eSIMs to this app, so that's not offered. */
+ *  the phone isn't using a slot with another eSIM card in it, which is likely the removable one. [quiet]: another slot
+ *  holds an eSIM card that didn't answer just now, likely the removable one too. In both, saying this chip is it would be
+ *  a mistake that hands Android's own eSIMs to this app, so that's not offered. */
 @Composable
-private fun BuiltInChip(idle: Boolean, onRetry: () -> Unit, onMine: () -> Unit) {
+private fun BuiltInChip(idle: Boolean, quiet: Boolean, onRetry: () -> Unit, onMine: () -> Unit) {
     val context = LocalContext.current
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(Modifier.verticalScroll(rememberScrollState()).padding(32.dp),
@@ -678,20 +681,29 @@ private fun BuiltInChip(idle: Boolean, onRetry: () -> Unit, onMine: () -> Unit) 
             Icon(painterResource(R.drawable.ic_warning), contentDescription = null, Modifier.size(48.dp),
                 tint = MaterialTheme.colorScheme.error)
             Spacer(Modifier.height(16.dp))
-            Text("This looks like your phone's own eSIM", style = MaterialTheme.typography.headlineSmall,
+            Text(if (quiet && !idle) "Your eSIM card didn't answer" else "This looks like your phone's own eSIM",
+                style = MaterialTheme.typography.headlineSmall,
                 textAlign = TextAlign.Center, modifier = Modifier.semantics { heading() })
             Spacer(Modifier.height(8.dp))
-            Text(if (idle) "The only eSIM chip this app can open may be the one built into this phone. Your phone isn't " +
-                "using another SIM slot that has an eSIM card in it, which may be your removable card. Turn that SIM on in " +
-                "your phone's SIM settings, then try again."
-                else "The only eSIM chip found may be the one built into this phone, not a removable card. Manage that one in " +
-                "your phone's Settings. If you have a removable eSIM card, check that it's in the SIM tray, then try again.",
+            Text(when {
+                idle -> "The only eSIM chip this app can open may be the one built into this phone. Your phone isn't " +
+                    "using another SIM slot that has an eSIM card in it, which may be your removable card. Turn that SIM " +
+                    "on in your phone's SIM settings, then try again."
+                quiet -> "The eSIM card in your SIM tray didn't answer just now, as while it restarts. Only the eSIM " +
+                    "chip built into this phone did, and nothing on it is shown or changed here. Wait a moment, then " +
+                    "try again."
+                else -> "The only eSIM chip found may be the one built into this phone, not a removable card. Manage " +
+                    "that one in your phone's Settings. If you have a removable eSIM card, check that it's in the SIM " +
+                    "tray, then try again."
+            },
                 style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(24.dp))
             if (idle) {
                 Button(onClick = { openSimSettings(context, null, -1) }) { Text("SIM settings") }
                 TextButton(onClick = onRetry) { Text("Try again") }
+            } else if (quiet) {
+                Button(onClick = onRetry) { Text("Try again") }
             } else {
                 Button(onClick = onRetry) { Text("Try again") }
                 TextButton(onClick = onMine) { Text("It's my removable card") }
@@ -748,19 +760,45 @@ private fun CardDetailsSheet(ui: LpaUi, onShown: () -> Unit, onDismiss: () -> Un
             Text("Details", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.semantics { heading() })
             EidCard(eid, "Your eSIM card's own ID number. Some providers ask for it.")
             InfoCard {
+                val info = ui.cardInfo
+                fun reported(value: String?) = value ?: if (ui.cardInfoLoading) "Checking…" else "Not reported"
+                // Remembered, so the row is there from the start; reading the card's info updates it.
+                ui.knownCardName?.let { name ->
+                    InfoRow("Card name", name.value, when (name.from) {
+                        CardFacts.Name.From.IN_USE -> "The name the card gives itself, which your phone shows while " +
+                            "none of the card's eSIMs is on."
+                        CardFacts.Name.From.SEEN -> "The first name your phone recorded for this card that isn't one of " +
+                            "its eSIMs. Usually the card's own name."
+                        CardFacts.Name.From.MANAGER_ID -> "Known from the card's own eSIM manager."
+                    })
+                    InfoDivider()
+                }
                 InfoRow("SIM slot", "SIM ${ui.simNumber}", "Most eSIMs need data roaming on for this SIM to work.")
                 InfoDivider()
                 val hidden = ui.profiles.count { !it.enabled && it.iccid in ui.hidden }
                 InfoRow("eSIMs on the card", "${ui.profiles.size}" + if (hidden > 0) " ($hidden hidden)" else "")
                 InfoDivider()
-                val info = ui.cardInfo
-                fun reported(value: String?) = value ?: if (ui.cardInfoLoading) "Checking…" else "Not reported"
                 InfoRow("Free space", reported(info?.freeBytes?.let(::formatBytes)), "Room left on the card for new eSIMs.")
+                InfoDivider()
+                InfoRow("Integrated RAM", reported(info?.freeRam?.let { "${formatBytes(it)} free" }),
+                    "Every SIM card has its own RAM, separate from the phone.")
                 InfoDivider()
                 InfoRow("eSIM standard", reported(info?.standard?.let { "SGP.22 v$it" }))
                 InfoDivider()
                 InfoRow("Firmware", reported(info?.firmware))
                 InfoDivider()
+                val maker = CardFacts.maker(eid, info?.factory)
+                if (maker != null || info?.factory != null) {
+                    InfoRow("Made by", maker?.let { (company, site) -> company + (site?.let { " ($it)" } ?: "") }
+                        ?: "Not known to this app",
+                        "The company that built the card for its brand." +
+                            (info?.factory?.let { " Its factory's GSMA accreditation from when the card was made: $it." } ?: ""))
+                    InfoDivider()
+                }
+                CardFacts.category(info?.category)?.let {
+                    InfoRow("Chip category", it, CardFacts.CATEGORY_HELP)
+                    InfoDivider()
+                }
                 InfoRow("Certificates", reported(info?.rootNames?.takeIf { it.isNotEmpty() }?.joinToString(", ")),
                     "The card only installs eSIMs from providers certified under these. Mainstream providers use GSMA.")
                 InfoDivider()

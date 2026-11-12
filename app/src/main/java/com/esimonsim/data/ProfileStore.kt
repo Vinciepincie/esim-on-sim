@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import androidx.core.content.edit
 import com.esimonsim.apdu.AccessMethod
 import com.esimonsim.lpa.ActivationCode
+import com.esimonsim.lpa.CardFacts
 import com.esimonsim.lpa.Hex
 import org.json.JSONObject
 import java.security.MessageDigest
@@ -55,6 +56,29 @@ class ProfileStore internal constructor(private val prefs: SharedPreferences) {
 
     fun setCardSlot(how: AccessMethod?, eid: String, slot: Int) = prefs.edit { putInt("$CARD_SLOT$how:$eid", slot) }
 
+    /** The name card [eid] gives itself, as last found ([com.esimonsim.lpa.CardFacts.name]), for when it can't be asked. */
+    fun cardName(eid: String): CardFacts.Name? = prefs.getString(CARD_NAME + eid, null)?.let { saved ->
+        val parts = saved.split(':', limit = 3) // how it's known, the ICCID it came from (may be empty), the name
+        if (parts.size != 3) return null
+        val from = runCatching { CardFacts.Name.From.valueOf(parts[0]) }.getOrNull() ?: return null
+        CardFacts.Name(parts[2], from, parts[1].ifEmpty { null })
+    }
+
+    fun setCardName(eid: String, name: CardFacts.Name?) = prefs.edit {
+        if (name == null) remove(CARD_NAME + eid) else putString(CARD_NAME + eid, "${name.from}:${name.iccid.orEmpty()}:${name.value}")
+    }
+
+    /** The ICCIDs this app has seen in card [eid]'s list, deleted ones too: none is the card's own profile. */
+    fun seenOnCard(eid: String): Set<String> = prefs.getStringSet(SEEN_ON_CARD + eid, null)?.toSet() ?: emptySet()
+
+    /** Adds [iccids] to [seenOnCard]; writes only when one is new. Lists are read on the card's own thread too. */
+    @Synchronized
+    fun addSeenOnCard(eid: String, iccids: Collection<String>) {
+        val seen = seenOnCard(eid)
+        val all = seen + iccids.filter { it.isNotEmpty() }
+        if (all.size != seen.size) prefs.edit { putStringSet(SEEN_ON_CARD + eid, all) }
+    }
+
     /** A look found no eSIM manager behind this [token] in this slot, so it's not worth opening while the token stays.
      *  Reconnecting asks again ([clearNoManagers]). */
     fun noManager(how: AccessMethod?, slot: Int, token: String) = "$how:$slot:$token" in noManagers()
@@ -103,6 +127,8 @@ class ProfileStore internal constructor(private val prefs: SharedPreferences) {
     }
 
     companion object {
+        private const val CARD_NAME = "card-name:"
+        private const val SEEN_ON_CARD = "seen-on-card:"
         private const val NOTE = "note:"
         private const val INSTALL = "install:"
         private const val SAME_NAME = "same-name-dismissed"

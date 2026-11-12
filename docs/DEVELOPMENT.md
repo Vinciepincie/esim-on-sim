@@ -325,7 +325,9 @@ adb shell 'echo "{\"delayMs\":250,\"refreshMs\":6000,\"dropEnableReply\":true}" 
 
 Options: `delayMs`, `jitterMs`, `failRate`, `hangAt`, `exitAt`, `refreshMs`,
 `dropEnableReply`, `useSimDelayMs`, `useSimRefuse`, `absent`, `slot`, `slots`,
-`defaultDp`, `rootDs`, `startDelayMs`, `openDelayMs`, `aid`, `cards`, `hangSlot`, `omapi` (see the class comment).
+`defaultDp`, `rootDs`, `startDelayMs`, `openDelayMs`, `aid`, `cards`, `hangSlot`, `omapi`, `records` (see the class
+comment). `records` is Android's memory of the profiles it has seen on cards, for the Card name row in Details, each
+with the card's `eid`: `{"records":[{"eid":"<the card's EID>","iccid":"8900000000000000011","name":"5ber","source":1,"id":3}]}`.
 `cards` puts several simulated cards in the phone, each with its own eSIMs, for example
 `{"cards":[{"slot":0},{"slot":1}],"slots":[{"euicc":true,"token":"a"},{"euicc":true,"token":"b"}]}`.
 `slots` is what Android says, not worked out from `cards`, so change both together: a card taken out is
@@ -403,22 +405,66 @@ component added for card access is the provider Shizuku's server hands its conne
 `INTERACT_ACROSS_USERS_FULL` can reach. Channel ownership is tracked per helper session, and channels are closed when its
 input ends.
 
-The helper reaches the card through the phone's telephony first (the calls above), and falls back to the **Secure Element
+The helper reaches the card through the phone's telephony (the calls above). Only when `Lpa.discover` has tried every
+slot and every eSIM manager ID through telephony and found no card does it search again through the **Secure Element
 HAL** (`android.hardware.secure_element.ISecureElement`, the AIDL HAL, Android 14+; 11-13 have only the older HIDL one,
-which the helper doesn't use, and a phone updated to 14 or later may still have only that one) when telephony gives no channel for a slot, refuses the helper outright (it throws, as for an
-ID it keeps for the system LPA), or the phone has none of telephony's channel calls at all. When the HAL can't help either,
-telephony's own answer or exception goes back to the app unchanged, so its messages stay the same. The HAL is the layer
-below both telephony and Android's own OMAPI service: a card the phone's telephony won't open can still answer there,
-below the OMAPI app check that direct access runs into.
+which the helper doesn't use, and a phone updated to 14 or later may still have only that one): an `open` request with
+`"via": "hal"` and the HAL `"reader"` to ask (0 for `SIM1`). A plain `open` is telephony alone, and its answer or
+exception goes back to the app unchanged. The HAL is the layer below both telephony and Android's own OMAPI service: a
+card the phone's telephony won't open, or won't give the helper at all, can still answer there, below the OMAPI app check
+that direct access runs into.
+
+**Why a search of its own (issue #1).** In 0.5 the helper asked the HAL on every telephony miss. On a rooted Pixel 9 Pro
+XL telephony missed the first ID, the 15-byte prefix, on the tray's 5ber. The HAL got in before the app had asked for
+5ber's own ID, which telephony would have opened. Its `SIM1` was the Pixel's built-in eSIM chip, which took the prefix
+too, so the app showed that chip's empty list as the 5ber's. HAL readers can follow the phone's SIM numbers rather than
+its trays, and Android doesn't say which. So the app's HAL search:
+
+- asks every slot's reader by its SIM number (`SlotInfo.logical`, as Android's own secure-element service numbers its
+  readers) for every ID first, and only then the reader by the slot's own number, a guess;
+- skips slots Android calls empty or unused, as whatever a reader finds there is another slot's card;
+- reads the EID and turns the card away when Android gives that EID for another slot, or another EID for this slot
+  (`Lpa.fitsSlot`); a guessed reader's card counts only when Android gives this slot that EID, or no other SIM is in
+  use (`Lpa.alone`);
+- marks the card as possibly the phone's own chip (`onBuiltInSlot`, so the app asks) unless Android gives this slot
+  that EID, while a built-in chip is in the phone that Android gives no EID for;
+- treats a link lost during the search as the connection error it is, not as "no card", and a card that opened on its
+  slot's SIM-number reader but failed as that card's error;
+- remembers the reader with the card (`Card.reader`), reopens it the same way, and reads the EID again on each reopen,
+  since a reader can come to reach another card when the phone numbers its SIMs anew; a refresh asks that reader first
+  (`Lpa.again`), and only as that card, by its EID, before searching through telephony again;
+- also runs when telephony found only the phone's own chip, which people haven't said is their card: a tray card only a
+  reader reaches goes before it, and the chip's EID, just read through telephony, can't pass for that card's. Slots
+  Android says hold an ordinary SIM are left out of that, as it would otherwise cost them a SELECT per ID at each refresh;
+- also runs when a card answered through telephony but then failed (its transmit refused, say), before that card's error
+  is shown;
+- writes a reader off after two errors, not one: one can be a passing error.
+
+The look for other cards (`Lpa.scan`) works in two passes: telephony on every slot first (a refused ID is passed over, as
+in discovery), then readers, with the same rules, for the slots telephony found no eSIM manager in or refused. So a reader
+never takes a card telephony finds in a later slot, and never one already known in another slot (the one in view, unless
+Android now calls its slot empty, or one found earlier in the look). A card found that way keeps its reader, so the
+switcher keeps it. A slot telephony refused whose reader by SIM number answers "no such applet" to every ID is settled
+(and marked as no eSIM manager where Android says it's an ordinary SIM), so it isn't asked again at every look; telephony's
+own "no eSIM manager" mark is only kept where the readers agree or have nothing to say.
+
+When the only chip that answered is the phone's own and another slot holds an eSIM card that was busy just then (no free
+channel, an unknown error, or it opened and failed; not a refusal), the held-back screen says the card didn't answer and
+offers "Try again" (`Lpa.quietSlot`), not "It's my removable card".
+
+`HalDiscoveryTest` runs the real `Lpa` over the real `CardShell` with stand-ins for that Pixel, and for a phone whose
+telephony refuses the helper everything.
 
 - **Loading it.** The HAL's Java interface isn't among the classes every process has: it comes inside Android's own
   secure-element app, `com.android.se`. The helper asks the package manager where that system app's APK is
   (`MATCH_SYSTEM_ONLY`), accepts it only on a read-only system partition (`CardShell.systemApk`: never `/data`, so never
   code an app could have written), and loads the interface from it with a `PathClassLoader`, once per process. This
-  happens the first time telephony misses, so a phone telephony serves never pays for it (a few milliseconds). Plain
+  happens the first time the app asks the HAL, so a phone telephony serves never pays for it (a few milliseconds). Plain
   `Class.forName` can't find the class, which is why the first version of this route never ran.
-- **Using it.** The helper looks up `.../SIM1`, `.../SIM2` from `ServiceManager` by slot, the order Android's own
-  secure-element app uses (Android doesn't define how those numbers map to slots). It calls `isCardPresent`,
+- **Using it.** The helper looks up `.../SIM1`, `.../SIM2` from `ServiceManager` by the reader the app names, and files
+  the channel under the request's slot. It answers as telephony would: status 2 (no such reader, no card in it, or it
+  refused the helper, which ends the app's search on that reader), 3 (no such applet, so the app tries its next ID) or 4.
+  A HAL channel whose number a telephony channel on that slot already has is given back. It calls `isCardPresent`,
   `openLogicalChannel`, `transmit` and `closeChannel`, and **never `init` or `reset`**: the HAL is shared with Android's own
   secure-element service and other apps' channels, and those calls would reset them. So it works only once that service
   has set the HAL up. The HAL sends the APDU straight to the card, so the helper puts the logical channel in the class byte
@@ -429,17 +475,39 @@ below the OMAPI app check that direct access runs into.
 - **Who may use it.** That is a ROM and SELinux matter. AOSP's policy lets ADB shell look the HAL up but not call it: its
   clients are the secure-element app, OMAPI and, on userdebug builds only, `su`. Android reports the refused call as a
   `DeadObjectException`, the same exception as for a HAL (or the phone process) that went away. The helper tells them
-  apart by the HAL's binder: still alive after a refusal, when it leaves that slot's HAL alone for a minute
-  (`HAL_RETRY_MS`) and telephony's answer stands; dead after the HAL's process went, when the next open looks it up
+  apart by the HAL's binder: still alive after a refusal, when it leaves that reader alone for a minute
+  (`HAL_RETRY_MS`); dead after the HAL's process went, when the next open looks it up
   afresh. Neither is taken for the phone process dying. So over Wireless debugging or Shizuku the route helps only on
   makers' builds that let shell call the HAL (users of another app report this on some Xiaomi and OPPO builds), and with
   root where the root manager's policy allows it.
 - **Tested** on Android 14, 17 and 17 QPR2 emulators against a stand-in HAL: the helper reads the EID through it when
-  SELinux allows the call (permissive, or as root), and falls back cleanly with telephony's own answer when it doesn't.
-  Not yet on a real phone or a real HAL.
+  SELinux allows the call (permissive, or as root), and answers "no card" when it doesn't. The issue #1 Pixel was
+  rebuilt on a rooted Android 14 emulator (stand-in telephony in the helper, stand-in HAL whose `SIM1` is an empty chip):
+  0.5 showed "No eSIMs yet", 0.6 lists the card's eSIMs. Not yet on a real phone or a real HAL.
 
 This changes the Android access route only; it does not rewrite the card's access rules, patch Android or defeat the
 operator's own profile authentication.
+
+### Card name and maker (Details)
+
+Removable eSIM cards carry a profile of their own besides the eSIMs in their list, which the card turns to when none of
+those is on; its provider name is the card's brand (a 5ber says "5ber"). It isn't in the card's eSIM list, and its files
+can only be read while it's the one on, so the app takes the name from Android's records instead. The helper's
+`cardRecords` request (read-only, no card I/O) returns, for one EID only, Android's record of each profile it has seen on
+that card (`ISub.getAllSubInfoList`, matched on `getCardString`, or `getCardId` on Android 9): ICCID, the name Android
+shows, where that name came from (from Android 10; 1 and 4 mean read from the card), Android's number for it and whether
+it's in use. `CardFacts.name` picks, in this order of trust: a record in use that isn't one of the card's eSIMs; the
+earliest such record (one matching the brand of a maker's eSIM manager ID first, where the card answered to one); that
+brand itself. The app remembers each card's name and the eSIMs it has seen on it (`ProfileStore`), so a deleted eSIM's
+leftover record isn't taken for the card's own, and a name stays known where Android's records can't be read (direct
+access, Android 6-8). Limits: no name if the phone never saw the card with no eSIM on; an eSIM deleted before this app saw
+it can still pass for the card's own name when it's the earliest record.
+
+"Made by" comes from the EID's first 8 digits, which the maker's GSMA-signed certificate ties to it (only `89086030`,
+Eastcompeace, checked so far), then from the card's `sasAcreditationNumber` (GetEUICCInfo2): the GSMA accreditation of the
+factory for UICC production, `company-site-UP-expiry`, looked up by company and site (`CardFacts.SITES`, from the GSMA's
+own SAS-UP certificates). The expiry in it is the certificate's, written into the card when it was made: an old date is
+normal. It names who built the card, not the silicon.
 
 Android 17 QPR2's emulator image (CP41) adds the calling package to `iccTransmitApduLogicalChannelByPort`, after the
 slot and port; the helper matches that form too and passes `com.android.shell`. That argument is the calling package:

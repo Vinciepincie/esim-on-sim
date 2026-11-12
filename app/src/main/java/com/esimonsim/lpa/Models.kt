@@ -33,8 +33,9 @@ data class EuiccProfile(
 private fun String?.orNull() = this?.takeIf { it.isNotBlank() }
 
 /** A card: its [eid] says which, the rest where it answers, which only holds for one way in, as they number slots
- *  differently. [isdR]: the eSIM manager ID it answered to. [builtIn]: see [Lpa.onBuiltInSlot]. */
-data class Card(val eid: String, val slot: Int, val isdR: String, val builtIn: Boolean)
+ *  differently. [isdR]: the eSIM manager ID it answered to. [builtIn]: see [Lpa.onBuiltInSlot]. [reader]: the Secure
+ *  Element HAL reader it answered on (0 for SIM1), or -1 for telephony, the usual way. */
+data class Card(val eid: String, val slot: Int, val isdR: String, val builtIn: Boolean, val reader: Int = -1)
 
 /** What [Lpa.scan] made of a slot. [token] and [logical] as [com.esimonsim.apdu.SlotInfo] gives them. [noManager]: every
  *  eSIM manager ID was tried, and the card said it has no such thing. */

@@ -58,14 +58,20 @@ abstract class PipeApduBackend internal constructor(private val uids: Set<Int>) 
 
     override fun slots(): List<SlotInfo> = SlotInfo.list(rpc(JSONObject().put("op", "slots")).getJSONArray("slots"))
 
+    override fun cardRecords(eid: String): List<SimRecord> =
+        SimRecord.list(rpc(JSONObject().put("op", "cardRecords").put("eid", eid)).getJSONArray("records"))
+
     private fun request(op: String, slot: Int, port: Int, channel: Int = 0) = JSONObject()
         .put("op", op).put("slot", slot).put("port", port).put("channel", channel)
 
-    override fun openChannel(slot: Int, port: Int, aidHex: String): OpenResult {
-        val response = rpc(request("open", slot, port).put("aid", aidHex))
-        return OpenResult(response.getInt("channel"), response.getInt("status"),
-            response.getString("select").takeIf { it.isNotEmpty() }?.let(Hex::decode))
-    }
+    override fun openChannel(slot: Int, port: Int, aidHex: String): OpenResult =
+        opened(rpc(request("open", slot, port).put("aid", aidHex)))
+
+    override fun openChannelViaSecureElement(slot: Int, port: Int, reader: Int, aidHex: String): OpenResult =
+        opened(rpc(request("open", slot, port).put("aid", aidHex).put("via", "hal").put("reader", reader)))
+
+    private fun opened(response: JSONObject) = OpenResult(response.getInt("channel"), response.getInt("status"),
+        response.getString("select").takeIf { it.isNotEmpty() }?.let(Hex::decode))
 
     override fun transmit(slot: Int, port: Int, channel: Int, cla: Int, ins: Int, p1: Int, p2: Int, p3: Int, dataHex: String): String =
         rpc(request("transmit", slot, port, channel).put("cla", cla).put("ins", ins)

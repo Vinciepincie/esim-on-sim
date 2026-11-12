@@ -124,7 +124,17 @@ public final class FakeCardShell implements HelperServer.Session {
             case "slots": return out.put("slots", cfg.optJSONArray("slots") != null ? cfg.getJSONArray("slots")
                 : new JSONArray().put(new JSONObject().put("euicc", false).put("removable", true))
                     .put(new JSONObject().put("euicc", true).put("removable", false)));
-            case "open": return open(q.getInt("slot"), q.getString("aid"), out);
+            // Android's records of the profiles seen on a card: "records" in the config, each with the card's "eid".
+            case "cardRecords": {
+                JSONArray all = cfg.optJSONArray("records"), mine = new JSONArray();
+                for (int i = 0; all != null && i < all.length(); i++)
+                    if (all.getJSONObject(i).optString("eid").equalsIgnoreCase(q.getString("eid"))) mine.put(all.getJSONObject(i));
+                return out.put("records", mine);
+            }
+            case "open":
+                // The simulated card is reached as telephony reaches it: no phone here has a Secure Element HAL.
+                if (q.optString("via").equals("hal")) return out.put("channel", 0).put("status", 2).put("select", "");
+                return open(q.getInt("slot"), q.getString("aid"), out);
             case "close": {
                 Channel ch = channels.remove(q.getInt("channel"));
                 if (ch == null) throw new IllegalArgumentException("Channel is not owned by this session");

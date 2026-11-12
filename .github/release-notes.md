@@ -1,7 +1,8 @@
 ## What's new
 
-- **More cards open:** the app also asks with the card's full ID, for cards that don't answer to the shorter one.
-- **Android 14 and newer:** the app can also try the phone's SIM reader directly, which may help on rooted phones.
+- **Fixed: empty card with root on device with built-in eSIM.** When access is set via root the app would detect the phone's built-in eSIM chip instead of an card, causing it to look empty. (Bug introduced in version 0.5.)
+- **More cards in the card switcher:** a second card that only answers to its maker's own ID now shows up, and on rooted phones cards found through the SIM reader stay listed and are found faster on refresh.
+- **More card info:** Details now shows the card's own brand name, such as "5ber", once your phone has seen the card with none of its eSIMs on, who made the card, and how much of the card's own RAM is free.
 
 ## Download
 

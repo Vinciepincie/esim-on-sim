@@ -8,6 +8,11 @@ interface ApduBackend {
     fun isReady(): Boolean
     /** Open a logical channel to [aidHex] on the given slot/port. */
     fun openChannel(slot: Int, port: Int, aidHex: String): OpenResult
+    /** As [openChannel], through the phone's Secure Element HAL [reader] (0 for SIM1) instead, its channel then filed
+     *  under [slot]/[port]. Which card a reader reaches is the caller's to check: Android doesn't tie the two numbers.
+     *  Only the helper can ask; elsewhere there's never a card this way (status 2). */
+    fun openChannelViaSecureElement(slot: Int, port: Int, reader: Int, aidHex: String): OpenResult =
+        OpenResult(0, 2, null)
     /** Transmit one APDU on an open logical channel; returns response hex incl. SW. */
     fun transmit(slot: Int, port: Int, channel: Int, cla: Int, ins: Int, p1: Int, p2: Int, p3: Int, dataHex: String): String
     fun closeChannel(slot: Int, port: Int, channel: Int)
@@ -16,6 +21,21 @@ interface ApduBackend {
     fun slots(): List<SlotInfo> = emptyList()
     /** Whether a card is in [slot], as Android says without touching it. Null when it doesn't say. */
     fun present(slot: Int): Boolean? = slots().getOrNull(slot)?.present
+    /** What Android remembers of the SIM profiles it has seen on the card with [eid], on and off, without touching the
+     *  card. Only the helper can ask; elsewhere, and where Android doesn't tie records to EIDs, there are none. */
+    fun cardRecords(eid: String): List<SimRecord> = emptyList()
+}
+
+/** Android's record of one SIM profile it has seen on a card. [name]: the name it shows, from [nameSource] (Android's
+ *  NAME_SOURCE_*; 1 and 4 mean read from the card itself). [record]: Android's number for it, lower for one seen
+ *  earlier. [inUse]: the phone is using it now. */
+class SimRecord(val iccid: String, val name: String, val nameSource: Int?, val record: Int, val inUse: Boolean) {
+    internal companion object {
+        fun list(all: JSONArray) = List(all.length()) { i -> all.getJSONObject(i).let { o ->
+            SimRecord(o.optString("iccid"), o.optString("name"), if (o.has("source")) o.getInt("source") else null,
+                o.optInt("id", Int.MAX_VALUE), o.optBoolean("inUse"))
+        } }
+    }
 }
 
 /** A physical slot as Android sees it, without touching the card. [removable] is set per tray by the phone's maker, so it

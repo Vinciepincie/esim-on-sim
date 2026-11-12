@@ -854,7 +854,7 @@ class LpaTest {
         val (lpa, card) = connected { Hex.encode(info2) + "9000" }
         val info = lpa.cardInfo()
         assertEquals(Lpa.CardInfo(freeBytes = 409600, installedApps = 3, standard = "2.2.2", firmware = "4.2.0",
-            roots = listOf(gsma, other)), info)
+            roots = listOf(gsma, other), freeRam = 4096), info)
         assertEquals(listOf("GSMA", "Unknown 0B135963"), info.rootNames)
         assertEquals("BF2200", data(card.apdus.single()))
         assertEquals(0, card.openChannels)
